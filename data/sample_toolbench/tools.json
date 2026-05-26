@@ -1,0 +1,941 @@
+[
+  {
+    "category": "Finance",
+    "tool_name": "finance_market_data",
+    "tool_description": "Mock finance APIs for asset lookup, quotes, news, comparisons, and simulated price alert preferences.",
+    "api_list": [
+      {
+        "name": "search_symbol",
+        "description": "Resolve a company, asset, or crypto name to a market symbol.",
+        "method": "GET",
+        "url": "/finance/search_symbol",
+        "required_parameters": [
+          {"name": "query", "type": "STRING", "description": "Company, asset, or crypto name."}
+        ],
+        "optional_parameters": [
+          {"name": "asset_type", "type": "STRING", "description": "Asset type such as stock, crypto, etf, or forex."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "symbol": {"type": "string"},
+            "asset_id": {"type": "string"},
+            "exchange": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "get_quote",
+        "description": "Get the latest market quote for a symbol.",
+        "method": "get",
+        "url": "/finance/get_quote",
+        "required_parameters": [
+          {"name": "symbol", "type": "string", "description": "Market symbol returned by search_symbol."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "symbol": {"type": "string"},
+            "price": {"type": "number"},
+            "currency": {"type": "string"},
+            "change_pct": {"type": "number"}
+          }
+        }
+      },
+      {
+        "name": "get_company_news",
+        "description": "Get recent news for a company or asset.",
+        "method": "GET",
+        "url": "/finance/get_company_news",
+        "required_parameters": [
+          {"name": "symbol", "type": "STRING", "description": "Market symbol."}
+        ],
+        "optional_parameters": [
+          {"name": "limit", "type": "NUMBER", "description": "Maximum number of articles."}
+        ],
+        "response": {
+          "type": "object",
+          "properties": {
+            "articles": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "article_id": {"type": "string"},
+                  "headline": {"type": "string"},
+                  "sentiment": {"type": "string"}
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "compare_assets",
+        "description": "Compare multiple assets by recent performance.",
+        "method": "POST",
+        "url": "/finance/compare_assets",
+        "required_parameters": [
+          {"name": "symbols", "type": "array", "description": "Symbols to compare."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "comparison_id": {"type": "string"},
+            "rankings": {"type": "array"}
+          }
+        }
+      },
+      {
+        "name": "create_price_alert",
+        "description": "Simulate creating a price movement alert preference.",
+        "method": "POST",
+        "url": "/finance/create_price_alert",
+        "required_parameters": [
+          {"name": "symbol", "type": "STRING", "description": "Market symbol."},
+          {"name": "threshold", "type": "NUMBER", "description": "Price threshold."},
+          {"name": "direction", "type": "STRING", "description": "above or below."}
+        ],
+        "optional_parameters": [
+          {"name": "delivery_method", "type": "STRING", "description": "email, sms, or push."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "alert_id": {"type": "string"},
+            "status": {"type": "string"}
+          }
+        }
+      }
+    ]
+  },
+  {
+    "category": "Sports",
+    "tool_name": "sports_data",
+    "tool_description": "Mock sports APIs for teams, schedules, player statistics, comparisons, and game odds.",
+    "api_list": [
+      {
+        "name": "search_team",
+        "description": "Resolve a team name to a team ID.",
+        "method": "GET",
+        "url": "/sports/search_team",
+        "required_parameters": [
+          {"name": "query", "type": "STRING", "description": "Team name or city."}
+        ],
+        "optional_parameters": [
+          {"name": "league", "type": "STRING", "description": "League such as NBA, NFL, MLB, NHL, or EPL."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "team_id": {"type": "string"},
+            "team_name": {"type": "string"},
+            "league": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "get_schedule",
+        "description": "Get upcoming games for a team.",
+        "method": "GET",
+        "url": "/sports/get_schedule",
+        "required_parameters": [
+          {"name": "team_id", "type": "STRING", "description": "Team ID returned by search_team."}
+        ],
+        "optional_parameters": [
+          {"name": "date_range", "type": "STRING", "description": "Date range such as next_week or next_month."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "games": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "game_id": {"type": "string"},
+                  "opponent": {"type": "string"},
+                  "venue": {"type": "string"},
+                  "start_time": {"type": "string"}
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "get_player_stats",
+        "method": "GET",
+        "url": "/sports/get_player_stats",
+        "required_parameters": [
+          {"name": "player_name", "description": "Player name."},
+          {"name": "team_id", "type": "STRING", "description": "Team ID."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "player_id": {"type": "string"},
+            "stats": {"type": "object"}
+          }
+        }
+      },
+      {
+        "name": "compare_teams",
+        "description": "Compare two or more teams.",
+        "method": "POST",
+        "url": "/sports/compare_teams",
+        "required_parameters": [
+          {"name": "team_ids", "type": "ARRAY", "description": "Team IDs to compare."}
+        ],
+        "optional_params": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "comparison_id": {"type": "string"},
+            "strengths": {"type": "array"}
+          }
+        }
+      },
+      {
+        "name": "get_game_odds",
+        "description": "Get betting or prediction odds for a game.",
+        "method": "GET",
+        "url": "/sports/get_game_odds",
+        "required_parameters": [
+          {"name": "game_id", "type": "STRING", "description": "Game ID returned by get_schedule."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "odds_id": {"type": "string"},
+            "favorite": {"type": "string"},
+            "spread": {"type": "number"}
+          }
+        }
+      }
+    ]
+  },
+  {
+    "category": "Artificial_Intelligence_Machine_Learning",
+    "tool_name": "ai_model_ops",
+    "tool_description": "Mock AI and machine learning model catalog, cost estimation, and evaluation APIs.",
+    "api_list": [
+      {
+        "name": "list_models",
+        "description": "Find models for a task or provider.",
+        "method": "GET",
+        "url": "/ai_ml/list_models",
+        "required_parameters": [
+          {"name": "task", "type": "STRING", "description": "Task such as finance_sentiment, sports_prediction, travel_recommendation, game_recommendation, event_classification, restaurant_ranking, weather_risk_summary, or entertainment_recommendation."}
+        ],
+        "optional_parameters": [
+          {"name": "provider", "type": "STRING", "description": "Preferred model provider."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "models": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "model_id": {"type": "string"},
+                  "model_name": {"type": "string"},
+                  "capabilities": {"type": "array"}
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "get_model_details",
+        "description": "Inspect model metadata.",
+        "method": "GET",
+        "url": "/ai_ml/get_model_details",
+        "required_parameters": [
+          {"name": "model_id", "type": "STRING", "description": "Model ID returned by list_models."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "context_window": {"type": "number"},
+            "pricing": {"type": "object"},
+            "latency_class": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "estimate_inference_cost",
+        "description": "Estimate model inference cost.",
+        "method": "POST",
+        "url": "/ai_ml/estimate_inference_cost",
+        "required_parameters": [
+          {"name": "model_id", "type": "STRING", "description": "Model ID."},
+          {"name": "tokens", "type": "INTEGER", "description": "Estimated tokens."},
+          {"name": "requests", "type": "integer", "description": "Estimated request count."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "estimate_id": {"type": "string"},
+            "estimated_cost": {"type": "number"}
+          }
+        }
+      },
+      {
+        "name": "create_eval_job",
+        "description": "Create an evaluation job for a model.",
+        "url": "/ai_ml/create_eval_job",
+        "required_parameters": [
+          {"name": "model_id", "type": "STRING", "description": "Model ID."},
+          {"name": "dataset_name", "type": "STRING", "description": "Dataset name."},
+          {"name": "metric", "type": "STRING", "description": "Evaluation metric."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "eval_job_id": {"type": "string"},
+            "status": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "get_eval_result",
+        "description": "Fetch the result of an evaluation job.",
+        "method": "GET",
+        "url": "/ai_ml/get_eval_result",
+        "required_parameters": [
+          {"name": "eval_job_id", "type": "STRING", "description": "Eval job ID returned by create_eval_job."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "score": {"type": "number"},
+            "passed": {"type": "boolean"},
+            "summary": {"type": "string"}
+          }
+        }
+      }
+    ]
+  },
+  {
+    "category": "Entertainment",
+    "tool_name": "entertainment_catalog",
+    "tool_description": "Mock APIs for movies, streaming availability, watchlists, and live shows.",
+    "api_list": [
+      {
+        "name": "search_movies",
+        "description": "Find movies or shows.",
+        "method": "GET",
+        "url": "/entertainment/search_movies",
+        "required_parameters": [
+          {"name": "query", "type": "STRING", "description": "Movie or show search query."}
+        ],
+        "optional_parameters": [
+          {"name": "genre", "type": "STRING", "description": "Genre filter."}
+        ],
+        "response_schema": {}
+      },
+      {
+        "name": "get_movie_details",
+        "description": "Get details for a movie or show.",
+        "method": "GET",
+        "url": "/entertainment/get_movie_details",
+        "required_parameters": [
+          {"name": "movie_id", "type": "STRING", "description": "Movie ID returned by search_movies."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "rating": {"type": "number"},
+            "runtime": {"type": "number"},
+            "cast": {"type": "array"}
+          }
+        }
+      },
+      {
+        "name": "get_streaming_availability",
+        "description": "Find where a title can be streamed.",
+        "method": "GET",
+        "url": "/entertainment/get_streaming_availability",
+        "required_parameters": [
+          {"name": "movie_id", "type": "STRING", "description": "Movie ID."},
+          {"name": "country", "type": "STRING", "description": "Country code."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "platforms": {"type": "array"},
+            "availability_id": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "create_watchlist_item",
+        "description": "Simulate adding a movie or show to a watchlist.",
+        "method": "POST",
+        "url": "/entertainment/create_watchlist_item",
+        "required_parameters": [
+          {"name": "movie_id", "type": "STRING", "description": "Movie ID."},
+          {"name": "user_id", "type": "UNKNOWN", "description": "Synthetic user ID."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "watchlist_item_id": {"type": "string"},
+            "status": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "search_live_shows",
+        "description": "Find live entertainment in a city.",
+        "method": "GET",
+        "url": "/entertainment/search_live_shows",
+        "required_parameters": [
+          {"name": "city", "type": "STRING", "description": "City name."},
+          {"name": "date", "type": "STRING", "description": "Event date."}
+        ],
+        "optional_parameters": [
+          {"name": "genre", "type": "STRING", "description": "Live show genre."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "show_id": {"type": "string"},
+            "venue": {"type": "string"},
+            "start_time": {"type": "string"}
+          }
+        }
+      }
+    ]
+  },
+  {
+    "category": "Travel",
+    "tool_name": "travel_planning",
+    "tool_description": "Mock travel APIs for flights, hotels, deals, hotel details, and simulated itinerary booking.",
+    "api_list": [
+      {
+        "name": "search_flights",
+        "description": "Find flights for a route and date.",
+        "method": "GET",
+        "path": "/travel/search_flights",
+        "required_parameters": [
+          {"name": "origin", "type": "STRING", "description": "Origin airport or city."},
+          {"name": "destination", "type": "STRING", "description": "Destination airport or city."},
+          {"name": "date", "type": "STRING", "description": "Flight date."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "flight_id": {"type": "string"},
+            "airline": {"type": "string"},
+            "price": {"type": "number"}
+          }
+        }
+      },
+      {
+        "name": "search_hotels",
+        "description": "Find hotels in a city.",
+        "method": "GET",
+        "url": "/travel/search_hotels",
+        "required_parameters": [
+          {"name": "city", "type": "STRING", "description": "Destination city."},
+          {"name": "check_in", "type": "STRING", "description": "Check-in date."}
+        ],
+        "optionalParameters": [
+          {"name": "max_price", "type": "NUMBER", "description": "Maximum nightly price."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "hotel_id": {"type": "string"},
+            "hotel_name": {"type": "string"},
+            "nightly_price": {"type": "number"}
+          }
+        }
+      },
+      {
+        "name": "search_travel_deals",
+        "description": "Find discounts or package deals for a destination.",
+        "method": "GET",
+        "url": "/travel/search_travel_deals",
+        "required_parameters": [
+          {"name": "destination", "type": "STRING", "description": "Destination city."},
+          {"name": "date", "type": "STRING", "description": "Travel date."}
+        ],
+        "optional_parameters": [
+          {"name": "deal_type", "type": "STRING", "description": "flight, hotel, package, or activity."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "deal_id": {"type": "string"},
+            "discount_pct": {"type": "number"},
+            "eligible_items": {"type": "array"}
+          }
+        }
+      },
+      {
+        "name": "get_hotel_details",
+        "description": "Get hotel details.",
+        "method": "GET",
+        "url": "/travel/get_hotel_details",
+        "required_parameters": [
+          {"name": "hotel_id", "type": "STRING", "description": "Hotel ID returned by search_hotels."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "amenities": {"type": "array"},
+            "rating": {"type": "number"},
+            "address": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "book_itinerary",
+        "description": "Simulate booking selected flight and hotel options.",
+        "method": "POST",
+        "url": "/travel/book_itinerary",
+        "required_parameters": [
+          {"name": "flight_id", "type": "STRING", "description": "Flight ID returned by search_flights."},
+          {"name": "hotel_id", "type": "STRING", "description": "Hotel ID returned by search_hotels."},
+          {"name": "traveler_name", "type": "STRING", "description": "Traveler name."}
+        ],
+        "optional_parameters": [
+          {"name": "deal_id", "type": "STRING", "description": "Optional deal ID returned by search_travel_deals."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "booking_id": {"type": "string"},
+            "status": {"type": "string"}
+          }
+        }
+      }
+    ]
+  },
+  {
+    "category": "Gaming",
+    "tool_name": "gaming_catalog",
+    "tool_description": "Mock gaming APIs for game search, metadata, player profiles, recommendations, and tournaments.",
+    "api_list": [
+      {
+        "name": "search_games",
+        "description": "Find games by query, platform, genre, store, or price type.",
+        "method": "GET",
+        "url": "/gaming/search_games",
+        "required_parameters": [
+          {"name": "query", "type": "STRING", "description": "Game search query."}
+        ],
+        "optional_parameters": [
+          {"name": "platform", "type": "STRING", "description": "pc, xbox, playstation, switch, or mobile."},
+          {"name": "genre", "type": "STRING", "description": "Game genre."},
+          {"name": "store", "type": "STRING", "description": "steam, epic, xbox_store, playstation_store, nintendo_eshop, or app_store."},
+          {"name": "price_type", "type": "STRING", "description": "free, paid, or subscription."},
+          {"name": "max_price", "type": "NUMBER", "description": "Maximum price."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "game_id": {"type": "string"},
+            "title": {"type": "string"},
+            "platforms": {"type": "array"},
+            "store": {"type": "string"},
+            "price": {"type": "number"},
+            "is_free": {"type": "boolean"}
+          }
+        }
+      },
+      {
+        "name": "get_game_details",
+        "description": "Get game metadata.",
+        "method": "GET",
+        "url": "/gaming/get_game_details",
+        "required_parameters": [
+          {"name": "game_id", "type": "STRING", "description": "Game ID returned by search_games."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "rating": {"type": "number"},
+            "developer": {"type": "string"},
+            "release_date": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "get_player_profile",
+        "description": "Get a player's gaming profile.",
+        "method": "GET",
+        "url": "/gaming/get_player_profile",
+        "required_parameters": [
+          {"name": "username", "type": "STRING", "description": "Player username."},
+          {"name": "platform", "type": "STRING", "description": "Gaming platform."}
+        ],
+        "optional_parameters": [],
+        "response_schema": null
+      },
+      {
+        "name": "recommend_games",
+        "description": "Recommend games using game and player context.",
+        "method": "POST",
+        "url": "/gaming/recommend_games",
+        "required_parameters": [
+          {"name": "game_id", "type": "STRING", "description": "Game ID."},
+          {"name": "player_id", "type": "STRING", "description": "Player ID."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "recommendation_id": {"type": "string"},
+            "games": {"type": "array"}
+          }
+        }
+      },
+      {
+        "name": "get_tournament_schedule",
+        "description": "Find tournaments for a game.",
+        "method": "GET",
+        "url": "/gaming/get_tournament_schedule",
+        "required_parameters": [
+          {"name": "game_id", "type": "STRING", "description": "Game ID."}
+        ],
+        "optional_parameters": [
+          {"name": "region", "type": "STRING", "description": "Tournament region."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "tournament_id": {"type": "string"},
+            "start_time": {"type": "string"},
+            "venue": {"type": "string"}
+          }
+        }
+      }
+    ]
+  },
+  {
+    "category": "Events",
+    "tool_name": "events_calendar",
+    "tool_description": "Mock APIs for public events, ticketing, and simulated calendar creation.",
+    "api_list": [
+      {
+        "name": "search_events",
+        "description": "Find events in a city or category.",
+        "method": "GET",
+        "url": "/events/search_events",
+        "required_parameters": [
+          {"name": "city", "type": "STRING", "description": "City name."},
+          {"name": "date", "type": "STRING", "description": "Event date."}
+        ],
+        "optional_parameters": [
+          {"name": "category", "type": "STRING", "description": "Event category."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "event_id": {"type": "string"},
+            "name": {"type": "string"},
+            "venue_id": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "get_event_details",
+        "description": "Get details for an event.",
+        "method": "GET",
+        "url": "/events/get_event_details",
+        "required_parameters": [
+          {"name": "event_id", "type": "STRING", "description": "Event ID returned by search_events."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "venue": {"type": "string"},
+            "start_time": {"type": "string"},
+            "ticket_required": {"type": "boolean"}
+          }
+        }
+      },
+      {
+        "name": "check_ticket_availability",
+        "description": "Check ticket availability.",
+        "method": "GET",
+        "url": "/events/check_ticket_availability",
+        "required_parameters": [
+          {"name": "event_id", "type": "STRING", "description": "Event ID."},
+          {"name": "quantity", "type": "NUMBER", "description": "Number of tickets."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "ticket_offer_id": {"type": "string"},
+            "price": {"type": "number"},
+            "available": {"type": "boolean"}
+          }
+        }
+      },
+      {
+        "name": "book_tickets",
+        "description": "Simulate booking event tickets.",
+        "method": "POST",
+        "url": "/events/book_tickets",
+        "required_parameters": [
+          {"name": "ticket_offer_id", "type": "STRING", "description": "Ticket offer ID."},
+          {"name": "attendee_name", "type": "STRING", "description": "Attendee name."}
+        ],
+        "optional_parameters": null,
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "ticket_booking_id": {"type": "string"},
+            "status": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "create_calendar_event",
+        "description": "Simulate adding a public event, meeting, reservation, game, reminder, or tournament to a calendar.",
+        "method": "POST",
+        "url": "/events/create_calendar_event",
+        "required_parameters": [
+          {"name": "title", "type": "STRING", "description": "Calendar title."},
+          {"name": "start_time", "type": "STRING", "description": "Start timestamp."},
+          {"name": "location", "type": "STRING", "description": "Location or meeting link."},
+          {"name": "event_type", "type": "STRING", "description": "public_event, meeting, reservation, sports_game, travel_reminder, tournament, or watch_party."}
+        ],
+        "optional_parameters": [
+          {"name": "attendees", "type": "ARRAY", "description": "Optional attendee emails or names."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "calendar_event_id": {"type": "string"},
+            "status": {"type": "string"}
+          }
+        }
+      }
+    ]
+  },
+  {
+    "category": "Food",
+    "tool_name": "restaurant_booking",
+    "tool_description": "Mock restaurant APIs for search, menus, availability, reservations, and dietary options.",
+    "api_list": [
+      {
+        "name": "search_restaurants",
+        "description": "Find restaurants by location and cuisine.",
+        "method": "GET",
+        "url": "/food/search_restaurants",
+        "required_parameters": [
+          {"name": "city", "type": "STRING", "description": "City name."}
+        ],
+        "optional_parameters": [
+          {"name": "cuisine", "type": "STRING", "description": "Cuisine type."},
+          {"name": "party_size", "type": "NUMBER", "description": "Number of diners."}
+        ],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "restaurant_id": {"type": "string"},
+            "name": {"type": "string"},
+            "rating": {"type": "number"}
+          }
+        }
+      },
+      {
+        "name": "get_menu",
+        "description": "Get restaurant menu information.",
+        "method": "GET",
+        "url": "/food/get_menu",
+        "required_parameters": [
+          {"name": "restaurant_id", "type": "STRING", "description": "Restaurant ID returned by search_restaurants."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "menu_id": {"type": "string"},
+            "popular_items": {"type": "array"},
+            "price_range": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "check_availability",
+        "description": "Check reservation slots.",
+        "method": "GET",
+        "url": "/food/check_availability",
+        "required_parameters": [
+          {"name": "restaurant_id", "type": "STRING", "description": "Restaurant ID."},
+          {"name": "date", "type": "STRING", "description": "Reservation date."},
+          {"name": "time", "type": "STRING", "description": "Requested time."},
+          {"name": "party_size", "type": "NUMBER", "description": "Number of diners."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "slot_id": {"type": "string"},
+            "available_time": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "make_reservation",
+        "description": "Simulate reserving a table.",
+        "method": "POST",
+        "url": "/food/make_reservation",
+        "required_parameters": [
+          {"name": "slot_id", "type": "STRING", "description": "Slot ID returned by check_availability."},
+          {"name": "customer_name", "type": "STRING", "description": "Customer name."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "reservation_id": {"type": "string"},
+            "status": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "get_dietary_options",
+        "description": "Check dietary matches.",
+        "method": "GET",
+        "url": "/food/get_dietary_options",
+        "required_parameters": [
+          {"name": "restaurant_id", "type": "STRING", "description": "Restaurant ID."},
+          {"name": "dietary_need", "type": "STRING", "description": "Dietary need such as vegan, gluten_free, halal, kosher, or nut_free."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "matching_items": {"type": "array"},
+            "confidence": {"type": "number"}
+          }
+        }
+      }
+    ]
+  },
+  {
+    "category": "Weather",
+    "tool_name": "weather_planning",
+    "tool_description": "Mock weather APIs for forecasts, active alerts, comparisons, hourly forecasts, and outdoor time windows.",
+    "api_list": [
+      {
+        "name": "get_forecast",
+        "description": "Get weather forecast by city and date.",
+        "method": "GET",
+        "url": "/weather/get_forecast",
+        "required_parameters": [
+          {"name": "city", "type": "STRING", "description": "City name."},
+          {"name": "date", "type": "STRING", "description": "Forecast date."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "forecast_id": {"type": "string"},
+            "condition": {"type": "string"},
+            "temperature": {"type": "number"}
+          }
+        }
+      },
+      {
+        "name": "get_active_alerts",
+        "method": "GET",
+        "url": "/weather/get_active_alerts",
+        "required_parameters": [
+          {"name": "city", "type": "STRING", "description": "City name."},
+          {"name": "date", "type": "STRING", "description": "Alert date."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "alert_id": {"type": "string"},
+            "severity": {"type": "string"},
+            "description": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "compare_destination_weather",
+        "description": "Compare weather across multiple cities.",
+        "method": "POST",
+        "url": "/weather/compare_destination_weather",
+        "required_parameters": [
+          {"name": "cities", "type": "ARRAY", "description": "Cities to compare."},
+          {"name": "date", "type": "STRING", "description": "Comparison date."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "comparison_id": {"type": "string"},
+            "best_city": {"type": "string"}
+          }
+        }
+      },
+      {
+        "name": "get_hourly_forecast",
+        "description": "Get hourly forecast details.",
+        "method": "GET",
+        "url": "/weather/get_hourly_forecast",
+        "required": [
+          {"name": "city", "type": "STRING", "description": "City name."},
+          {"name": "date", "type": "STRING", "description": "Forecast date."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "hourly": {"type": "array"},
+            "rain_probability": {"type": "number"}
+          }
+        }
+      },
+      {
+        "name": "recommend_outdoor_window",
+        "description": "Recommend the best time window for an outdoor activity.",
+        "method": "POST",
+        "url": "/weather/recommend_outdoor_window",
+        "required_parameters": [
+          {"name": "city", "type": "STRING", "description": "City name."},
+          {"name": "date", "type": "STRING", "description": "Activity date."},
+          {"name": "activity", "type": "STRING", "description": "Outdoor activity."}
+        ],
+        "optional_parameters": [],
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "window_id": {"type": "string"},
+            "start_time": {"type": "string"},
+            "end_time": {"type": "string"}
+          }
+        }
+      }
+    ]
+  }
+]

@@ -1,0 +1,15 @@
+*.pdf
+*.log
+*.tmp
+
+.env
+.env.*
+!.env.example
+
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+artifacts/
+data/outputs/
