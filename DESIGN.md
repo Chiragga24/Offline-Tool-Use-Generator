@@ -57,7 +57,7 @@ by default, with all LLM features behind opt-in flags.
 | mean deterministic score | 9.96 | 10.00 |
 | usable-for-training rate | 99% | 100% |
 
-Steering widens coverage without hurting quality. Full breakdown in §10.
+Steering widens coverage without hurting quality. Full breakdown in #10.
 
 **Test status:** 185 non-live tests pass without credentials
 (`pytest -m "not live"`); five `@pytest.mark.live` tests run when API
@@ -109,7 +109,7 @@ validator as `suggest_arguments`-derived ones — no privileged caller.
 | Decision | Why |
 |---|---|
 | **Deterministic-first, LLM opt-in throughout.** Every component has a deterministic path that satisfies the rubric; LLM features are toggles. | CI runs offline. Reviewers without credentials get a working pipeline. LLM features become realism boosters, not crash points. |
-| **Provider-neutral LLM client** with 10 hosted/local providers behind one `complete_json(system, user)` adapter. | An earlier HF-only path hit a provider billing wall mid-test. One client lets `.env` swap providers without touching agent code. See provider table at the end of §2. |
+| **Provider-neutral LLM client** with 10 hosted/local providers behind one `complete_json(system, user)` adapter. | An earlier HF-only path hit a provider billing wall mid-test. One client lets `.env` swap providers without touching agent code. See provider table at the end of #2. |
 | **Pydantic at every boundary** (registry, graph artifact, sampler result, executor errors, agent turns, judge scores, repair plans, dataset records). | One validation system; no schema drift between in-memory and on-disk; the assignment's structured-output requirement is satisfied by construction. |
 | **Per-chain RNG seed derived as `planner_seed*1_000_003 + plan_index`**, not threaded through a single RNG. | Steering on/off must not perturb each chain's individual RNG state — otherwise Run A and Run B aren't directly comparable at the per-chain level. |
 | **JSON-serializable graph, not Neo4j**; in-memory state, not a vector DB (Mem0 is opt-in). | Reviewer setup is `pip install`. The graph artifact is grep-able. |
@@ -156,7 +156,7 @@ provider names) plus `KG_MLE_LLM_BASE_URL=https://your-host/v1`.
 **Why Gemini is the default (honest version).** Gemini won on
 free-tier availability and familiarity. I tried Groq and Hugging Face
 first and hit friction with both (HF: the chat-route/model-availability
-and billing issues described in §11; Groq: setup/quota friction during
+and billing issues described in #11; Groq: setup/quota friction during
 testing), so I fell back to Gemini to get the pipeline exercised
 end-to-end. Given the time budget, I chose to invest in making the
 client *provider-neutral* — so any of the providers above can be
@@ -220,7 +220,7 @@ deterministic aliases (destination→city, venue→location,
 Guardrails: `canonical_name` must be in a whitelist; confidence ∈ [0,1];
 suggestions below threshold or for missing fields are rejected; original
 field names are never removed (they remain the actual call arguments).
-This is what the graph's grounding logic reads — see §4.
+This is what the graph's grounding logic reads — see #4.
 
 | Decision | Alternative | Why |
 |---|---|---|
@@ -554,7 +554,7 @@ which the coordinator includes in metadata so the judge and downstream
 analysis can see which conversations were LLM-driven. The `generate`
 and `diversity` commands both route through these agents under
 `--use-llm`; without it (the default and the reproducible baseline)
-they use the deterministic agents. See §12 for the diversity
+they use the deterministic agents. See #12 for the diversity
 reproducibility tradeoff.
 
 ### LLM failure modes
@@ -1014,7 +1014,7 @@ preserved for targeted runs.
 **Diversity + LLM generation: the reproducibility tradeoff.** The
 default `kgmle diversity` (no `--use-llm`) generates both runs
 deterministically — the reproducible baseline that isolates steering
-from model variance, and the one used for the result table in §10.
+from model variance, and the one used for the result table in #10.
 `--use-llm diversity` additionally routes both runs through LLM
 generator agents. We made this opt-in-under-`--use-llm` rather than
 deterministic-only because a reviewer with their own API quota should

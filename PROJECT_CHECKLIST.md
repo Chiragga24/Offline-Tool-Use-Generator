@@ -222,7 +222,7 @@ Testing reminder:
 - [x] Validate tool-call arguments against normalized endpoint parameters (Pydantic dynamic model + grounding check).
 - [ ] Validate mocked outputs against expected lightweight schema (deferred; mocks ARE schema-derived so they conform by construction).
 - [x] Add deterministic fallback behavior when schemas are incomplete (typed defaults per ParameterType).
-- [x] Document offline execution model in `DESIGN.md` (§13.7).
+- [x] Document offline execution model in `DESIGN.md` (#6).
 - [x] Add unit tests for output generation.
 - [x] Add unit tests for chained ID grounding.
 
@@ -236,7 +236,7 @@ Testing reminder:
   - scenario planner (DeterministicPlanner / LLMPlanner)
   - user simulator (DeterministicUser / LLMUser)
   - assistant/tool caller (DeterministicAssistant / LLMAssistant)
-  - tool executor (covered in §13.7 — OfflineExecutor)
+  - tool executor (covered in #6 — OfflineExecutor)
   - final response writer (folded into assistant — emits final_summary turn)
 - [x] Implement at least one structured-output agent (both Planner and Assistant via Pydantic).
 - [x] Generate role-tagged messages.
@@ -244,7 +244,7 @@ Testing reminder:
 - [x] Ensure 50-60% of output has at least 3 tool calls and at least 2 distinct tools (driven by CorpusPlanner's distribution; the coordinator faithfully realises the chain).
 - [x] Generate varied conversation lengths (via planner's length distribution + clarification turns adding length organically).
 - [x] Attach metadata for tools, domains, seed, chain, constraints, and generation mode (Conversation.metadata aggregates everything).
-- [x] Document agent communication protocol in `DESIGN.md` (§13.8).
+- [x] Document agent communication protocol in `DESIGN.md` (#7).
 - [x] Add unit tests for conversation schema (test_protocol.py, test_coordinator.py).
 - [x] Add integration test for a generated multi-step chain (test_coordinator.py + live test in test_llm_generator_live.py).
 

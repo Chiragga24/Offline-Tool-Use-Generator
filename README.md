@@ -204,7 +204,7 @@ When `--use-llm` is set, `llm_judge` carries the 5-dimension score object
 ```
 
 The `diversity` command writes a `diversity_report.json` with `run_a_no_steering`,
-`run_b_steering`, and a `comparison` block of per-metric deltas; see DESIGN.md §10
+`run_b_steering`, and a `comparison` block of per-metric deltas; see DESIGN.md #10
 for the metric definitions and the steering-on/off result table.
 
 ## Tests
