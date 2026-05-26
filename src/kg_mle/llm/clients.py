@@ -53,6 +53,8 @@ class StructuredLLMClient:
     def complete_json(self, *, system: str, user: str, temperature: float = 0.4) -> str:
         if self.provider == "gemini":
             return self._gemini_complete_json(system=system, user=user, temperature=temperature)
+        if self.provider == "anthropic":
+            return self._anthropic_complete_json(system=system, user=user, temperature=temperature)
         if self.provider == "groq":
             return self._openai_compatible_complete_json(
                 system=system,
@@ -60,7 +62,16 @@ class StructuredLLMClient:
                 temperature=temperature,
                 default_base_url="https://api.groq.com/openai/v1",
             )
-        if self.provider in {"openai", "deepseek", "qwen", "together", "xai", "lmstudio", "vllm"}:
+        if self.provider in {
+            "openai",
+            "deepseek",
+            "qwen",
+            "together",
+            "xai",
+            "lmstudio",
+            "vllm",
+            "ollama",
+        }:
             return self._openai_compatible_complete_json(
                 system=system,
                 user=user,
@@ -97,6 +108,52 @@ class StructuredLLMClient:
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMClientError(f"Gemini response did not contain text: {data!r}") from exc
 
+    def _anthropic_complete_json(self, *, system: str, user: str, temperature: float) -> str:
+        """Anthropic Messages API.
+
+        Anthropic doesn't expose a native `response_format=json_object`. We
+        compose JSON output by (a) prepending a strict JSON-only instruction
+        to the system prompt and (b) prefilling the assistant turn with `{`
+        so the model continues a JSON object instead of preamble prose. The
+        leading `{` is restored to the returned content.
+        """
+        if not self.api_key:
+            raise LLMClientError("Anthropic provider requires ANTHROPIC_API_KEY.")
+        base_url = (self.base_url or "https://api.anthropic.com").rstrip("/")
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        json_system = (
+            f"{system}\n\n"
+            "Return ONLY a single valid JSON object. "
+            "No markdown fences, no commentary."
+        )
+        payload = {
+            "model": self.model,
+            "max_tokens": 1500,
+            "temperature": temperature,
+            "system": json_system,
+            "messages": [
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": "{"},
+            ],
+        }
+        data = _post_json(
+            f"{base_url}/v1/messages",
+            payload,
+            headers=headers,
+            timeout_seconds=self.timeout_seconds,
+        )
+        try:
+            content_blocks = data["content"]
+            text_parts = [block.get("text", "") for block in content_blocks if block.get("type") == "text"]
+            if not text_parts:
+                raise LLMClientError(f"Anthropic response had no text block: {data!r}")
+            return "{" + "".join(text_parts)
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise LLMClientError(f"Anthropic response did not contain text: {data!r}") from exc
+
     def _openai_compatible_complete_json(
         self,
         *,
@@ -105,7 +162,7 @@ class StructuredLLMClient:
         temperature: float,
         default_base_url: str | None,
     ) -> str:
-        if not self.api_key and self.provider not in {"lmstudio", "vllm"}:
+        if not self.api_key and self.provider not in {"lmstudio", "vllm", "ollama"}:
             raise LLMClientError(f"{self.provider} provider requires an API key.")
         base_url = (self.base_url or default_base_url or "").rstrip("/")
         if not base_url:
@@ -197,6 +254,7 @@ def _post_json(
 def _default_openai_compatible_base_url(provider: str) -> str | None:
     return {
         "deepseek": "https://api.deepseek.com/v1",
+        "ollama": "http://localhost:11434/v1",
         "openai": "https://api.openai.com/v1",
         "qwen": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         "together": "https://api.together.xyz/v1",

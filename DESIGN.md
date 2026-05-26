@@ -99,7 +99,7 @@ validator as `suggest_arguments`-derived ones — no privileged caller.
 | Decision | Why |
 |---|---|
 | **Deterministic-first, LLM opt-in throughout.** Every component has a deterministic path that satisfies the rubric; LLM features are toggles. | CI runs offline. Reviewers without credentials get a working pipeline. LLM features become realism boosters, not crash points. |
-| **Provider-neutral LLM client** (Gemini default, Groq backup, OpenAI-compatible, HF). | An earlier HF-only path hit a provider billing wall mid-test. One client lets `.env` swap providers without touching agent code. |
+| **Provider-neutral LLM client** with 10 hosted/local providers behind one `complete_json(system, user)` adapter. | An earlier HF-only path hit a provider billing wall mid-test. One client lets `.env` swap providers without touching agent code. See provider table at the end of §2. |
 | **Pydantic at every boundary** (registry, graph artifact, sampler result, executor errors, agent turns, judge scores, repair plans, dataset records). | One validation system; no schema drift between in-memory and on-disk; the assignment's structured-output requirement is satisfied by construction. |
 | **Per-chain RNG seed derived as `planner_seed*1_000_003 + plan_index`**, not threaded through a single RNG. | Steering on/off must not perturb each chain's individual RNG state — otherwise Run A and Run B aren't directly comparable at the per-chain level. |
 | **JSON-serializable graph, not Neo4j**; in-memory state, not a vector DB (Mem0 is opt-in). | Reviewer setup is `pip install`. The graph artifact is grep-able. |
@@ -117,6 +117,45 @@ validator as `suggest_arguments`-derived ones — no privileged caller.
   rename pass. The honest path forward is `domain/tool_name/name` and a
   migration; I didn't take it because the curated fixture has no
   collisions.
+
+### Hosted LLM provider support
+
+`src/kg_mle/llm/clients.py` exposes one `complete_json(system, user)`
+adapter. Any of these can be selected via `KG_MLE_LLM_PROVIDER` in
+`.env`; the matching API key is read from the env var below.
+
+| Provider | API shape | Default model | Env var | Default base URL |
+|---|---|---|---|---|
+| **Gemini** *(default)* | Native `generateContent` with `responseMimeType=application/json` | `gemini-2.0-flash-lite-001` | `GOOGLE_API_KEY` | hardcoded |
+| **Anthropic** | Native Messages API, JSON via prefilled `{` | `claude-3-5-haiku-latest` | `ANTHROPIC_API_KEY` | `api.anthropic.com` |
+| **Groq** | OpenAI-compatible `chat/completions` | `llama-3.1-8b-instant` | `GROQ_API_KEY` | `api.groq.com/openai/v1` |
+| **OpenAI** | OpenAI-compatible | `gpt-4.1-mini` | `OPENAI_API_KEY` | `api.openai.com/v1` |
+| **DeepSeek** | OpenAI-compatible | `deepseek-chat` | `DEEPSEEK_API_KEY` | `api.deepseek.com/v1` |
+| **Qwen (DashScope)** | OpenAI-compatible | `qwen-plus` | `DASHSCOPE_API_KEY` | DashScope compatible-mode |
+| **Together AI** | OpenAI-compatible | `google/gemma-2-9b-it` | `TOGETHER_API_KEY` | `api.together.xyz/v1` |
+| **xAI (Grok)** | OpenAI-compatible | `grok-3-mini` | `XAI_API_KEY` | `api.x.ai/v1` |
+| **Hugging Face** | `huggingface_hub.InferenceClient` | `google/gemma-4-E2B-it` | `HF_TOKEN` | router |
+| **Ollama** *(local)* | OpenAI-compatible, no key | `gemma4` | — | `localhost:11434/v1` |
+| **LM Studio** *(local)* | OpenAI-compatible, no key | `local-model` | — | `KG_MLE_LLM_BASE_URL` |
+| **vLLM** *(local)* | OpenAI-compatible, no key | `google/gemma-4-E2B-it` | — | `KG_MLE_LLM_BASE_URL` |
+
+Any other OpenAI-compatible API can be added without code changes by
+setting `KG_MLE_LLM_PROVIDER=openai` (or any of the OpenAI-compatible
+provider names) plus `KG_MLE_LLM_BASE_URL=https://your-host/v1`.
+
+**Anthropic JSON-mode trick.** Anthropic's Messages API doesn't expose a
+native `response_format=json_object`, so the adapter does two things:
+prepends a strict "return only JSON" instruction to the system prompt,
+and prefills the assistant turn with `{` (Anthropic supports
+assistant-side prefill). The model continues a JSON object instead of
+preamble prose; the leading `{` is restored to the returned content.
+
+**Honest gap.** Anthropic's tool-use API (which forces structured JSON
+via tool schemas) would be a stronger guarantee than the prefilled-`{`
+trick, but it would couple our prompt design to Anthropic-specific tool
+definitions. The current approach works for the JSON-extraction parser
+the agents already use and stays prompt-shape-portable across
+providers.
 
 ## 3. Tool Registry
 

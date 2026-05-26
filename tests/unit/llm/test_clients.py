@@ -100,3 +100,101 @@ def test_structured_client_raises_without_gemini_key():
 
     with pytest.raises(LLMClientError, match="GOOGLE_API_KEY"):
         client.complete_json(system="Return JSON.", user="Ping.")
+
+
+def test_anthropic_complete_json_uses_messages_api_with_prefilled_brace(monkeypatch):
+    """Anthropic has no native JSON mode. We prepend a JSON-only instruction
+    to the system prompt and prefill the assistant turn with `{`, then
+    restore the leading brace on the returned content."""
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["headers"] = dict(req.header_items())
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse(
+            {
+                "content": [
+                    {"type": "text", "text": '"provider": "anthropic"}'}
+                ],
+                "stop_reason": "end_turn",
+            }
+        )
+
+    monkeypatch.setattr("kg_mle.llm.clients.request.urlopen", fake_urlopen)
+    client = StructuredLLMClient(
+        provider="anthropic",
+        model="claude-3-5-haiku-latest",
+        api_key="test-anthropic-key",
+    )
+
+    result = client.complete_json(system="Return JSON.", user="Ping.")
+
+    assert result == '{"provider": "anthropic"}'
+    assert captured["url"] == "https://api.anthropic.com/v1/messages"
+    assert captured["headers"]["X-api-key"] == "test-anthropic-key"
+    assert captured["headers"]["Anthropic-version"] == "2023-06-01"
+    assert "Return ONLY a single valid JSON object" in captured["payload"]["system"]
+    # Last message is the prefilled assistant turn forcing JSON.
+    assert captured["payload"]["messages"][-1] == {"role": "assistant", "content": "{"}
+
+
+def test_anthropic_raises_without_api_key():
+    client = StructuredLLMClient(
+        provider="anthropic",
+        model="claude-3-5-haiku-latest",
+        api_key=None,
+    )
+
+    with pytest.raises(LLMClientError, match="ANTHROPIC_API_KEY"):
+        client.complete_json(system="Return JSON.", user="Ping.")
+
+
+def test_ollama_uses_openai_compatible_localhost_by_default(monkeypatch):
+    """Ollama's `/v1/chat/completions` is OpenAI-compatible and runs locally;
+    no API key is required by default."""
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["headers"] = dict(req.header_items())
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse(
+            {"choices": [{"message": {"content": '{"provider": "ollama"}'}}]}
+        )
+
+    monkeypatch.setattr("kg_mle.llm.clients.request.urlopen", fake_urlopen)
+    client = StructuredLLMClient(
+        provider="ollama",
+        model="gemma4",
+        api_key=None,
+    )
+
+    result = client.complete_json(system="Return JSON.", user="Ping.")
+
+    assert result == '{"provider": "ollama"}'
+    assert captured["url"] == "http://localhost:11434/v1/chat/completions"
+    # No Authorization header — ollama doesn't need a bearer token by default.
+    assert "Authorization" not in captured["headers"]
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
+
+
+def test_ollama_honors_custom_base_url(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        return _FakeResponse(
+            {"choices": [{"message": {"content": "{}"}}]}
+        )
+
+    monkeypatch.setattr("kg_mle.llm.clients.request.urlopen", fake_urlopen)
+    client = StructuredLLMClient(
+        provider="ollama",
+        model="gemma4",
+        api_key=None,
+        base_url="http://remote-ollama:11434/v1",
+    )
+
+    client.complete_json(system="Return JSON.", user="Ping.")
+    assert captured["url"] == "http://remote-ollama:11434/v1/chat/completions"
