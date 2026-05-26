@@ -184,25 +184,30 @@ Testing reminder:
 
 ### 4. Tool-Chain Sampler
 
-- [ ] Implement sampler that uses the graph, not hardcoded chains.
-- [ ] Support constraints:
-  - exact number of steps
+- [x] Implement sampler that uses the graph, not hardcoded chains.
+- [x] Support constraints:
+  - exact number of steps (n_steps as int)
+  - range of steps (n_steps as (min, max))
   - minimum number of distinct tools
-  - required domain
-  - required multi-step dependency
-  - allow/disallow parallel pattern
-- [ ] Implement deterministic sampling with seed.
-- [ ] Track sampling metadata.
-- [ ] Support cross-conversation steering toggle.
-- [ ] Add steering penalties for overused domains, tools, endpoint pairs, and chain patterns.
-- [ ] Document constraint interface in `DESIGN.md`.
-- [ ] Add unit tests for constraints.
-- [ ] Add unit tests for deterministic sampling.
+  - minimum number of distinct domains
+  - required domain(s)
+  - required endpoint
+  - minimum grounded transitions (the "coherent chaining" knob)
+  - allow/disallow semantic edges
+  - forbidden endpoint ids (steering hook)
+  - [ ] parallel pattern (deferred to planner alongside parallel-chain generation)
+- [x] Implement deterministic sampling with seed.
+- [x] Track sampling metadata (domains, tools, advance_type counts, backtracks, start_endpoint).
+- [ ] Support cross-conversation steering toggle (next, via planner).
+- [ ] Add steering penalties for overused domains, tools, endpoint pairs, and chain patterns (next, via planner).
+- [x] Document constraint interface in `DESIGN.md`.
+- [x] Add unit tests for constraints.
+- [x] Add unit tests for deterministic sampling.
 
 Testing reminder:
 
-- [ ] Test that `--no-cross-conversation-steering` produces reproducible unsteered samples.
-- [ ] Test that steering changes distribution across a corpus.
+- [ ] Test that `--no-cross-conversation-steering` produces reproducible unsteered samples (planner-level).
+- [ ] Test that steering changes distribution across a corpus (planner-level).
 
 ### 5. Offline Tool Execution
 
