@@ -1,0 +1,74 @@
+{
+  "summary": {
+    "conversation_count": 100,
+    "mean_deterministic_score": 10.0,
+    "mean_chain_completion": 1.0,
+    "mean_tool_response_coverage": 1.0,
+    "schema_valid_rate": 1.0,
+    "llm_judged_count": 0,
+    "mean_llm_overall_score": null,
+    "usable_for_training_rate": 1.0
+  },
+  "repair_summary": {
+    "enabled": true,
+    "attempted": 0,
+    "repaired": 0,
+    "failed": 0,
+    "rejected": 0,
+    "regenerated": 0,
+    "status_counts": {}
+  },
+  "records": [
+    {
+      "conversation_id": "conv_42_00000",
+      "schema_valid": true,
+      "schema_error": null,
+      "role_sequence_valid": true,
+      "n_messages": 12,
+      "n_assistant_tool_calls": 4,
+      "n_tool_messages": 4,
+      "n_tool_errors": 0,
+      "tool_response_coverage": 1.0,
+      "chain_completion": 1.0,
+      "error_free_trace": 1.0,
+      "deterministic_score": 10.0,
+      "llm_judge": null,
+      "quality_band": "gold",
+      "usable_for_training": true
+    },
+    {
+      "conversation_id": "conv_42_00001",
+      "schema_valid": true,
+      "schema_error": null,
+      "role_sequence_valid": true,
+      "n_messages": 8,
+      "n_assistant_tool_calls": 2,
+      "n_tool_messages": 2,
+      "n_tool_errors": 0,
+      "tool_response_coverage": 1.0,
+      "chain_completion": 1.0,
+      "error_free_trace": 1.0,
+      "deterministic_score": 10.0,
+      "llm_judge": null,
+      "quality_band": "gold",
+      "usable_for_training": true
+    },
+    {
+      "conversation_id": "conv_42_00002",
+      "schema_valid": true,
+      "schema_error": null,
+      "role_sequence_valid": true,
+      "n_messages": 10,
+      "n_assistant_tool_calls": 3,
+      "n_tool_messages": 3,
+      "n_tool_errors": 0,
+      "tool_response_coverage": 1.0,
+      "chain_completion": 1.0,
+      "error_free_trace": 1.0,
+      "deterministic_score": 10.0,
+      "llm_judge": null,
+      "quality_band": "gold",
+      "usable_for_training": true
+    }
+  ]
+}

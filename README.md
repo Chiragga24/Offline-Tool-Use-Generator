@@ -2,6 +2,13 @@
 
 This repository contains a production-oriented MVP for the SAP offline KG + MLE exercise.
 
+![Pipeline workflow](docs/workflow_diagram.png)
+
+Architecture and design rationale are in [DESIGN.md](DESIGN.md). A 3-record
+slice of a real seed-42 run (generated, scored, and metrics) lives in
+[`docs/sample_outputs/`](docs/sample_outputs) so you can see the output shape
+without running anything.
+
 ## Quickstart
 
 ```powershell

@@ -10,6 +10,10 @@ known gaps are called out in each section rather than buried.
 
 **Pipeline:**
 
+![KG + MLE pipeline workflow](docs/workflow_diagram.png)
+
+The same flow in text (grep-able):
+
 ```text
 ToolBench JSON
   └─► load_registry + enrich   ──► artifacts/registry.json
@@ -24,6 +28,10 @@ ToolBench JSON
                                                   └─► optional repair pass
                                                         └─► scored JSONL + metrics
 ```
+
+Sample committed outputs (a 3-record slice of a real seed-42 run) live in
+`docs/sample_outputs/` — generated conversations, scored conversations
+(with `metadata.evaluation`), and the metrics summary.
 
 **CLI** (`src/kg_mle/cli.py`): `build`, `generate`, `evaluate`, `diversity`,
 plus a global `--use-llm` switch that activates hosted-LLM features where
