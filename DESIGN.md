@@ -878,28 +878,60 @@ applying the plan still runs through the deterministic apply layer.
 
 ### Failed prompt iteration
 
-An earlier registry-enrichment prompt called Hugging Face-hosted models
-as generic chat models with the model name `google/gemma-4-E2B-it`.
+**The iteration that didn't work: trusting the prompt to produce valid
+JSON.** The first version of the agent and judge prompts simply
+instructed the model to "return only a JSON object," and the code
+parsed the raw text directly with `json.loads`. This works with frontier
+models but **breaks constantly with the smaller, non-frontier models we
+actually run on** (free-tier Gemini, open models via Groq/HF, local
+Ollama/Gemma). Observed failure modes:
 
-**What went wrong:**
+- markdown code fences around the JSON (` ```json … ``` `);
+- a sentence of preamble before the object ("Here is the plan: { … }");
+- trailing commentary after the closing brace;
+- missing required fields, or fields with the wrong type
+  (e.g. `confidence: "high"` instead of a float);
+- for the planner specifically, a plan whose `step_plans` didn't match
+  the sampled chain (wrong endpoint, wrong count) — structurally valid
+  JSON, semantically wrong.
 
-- Gemma wasn't available through the selected HF chat route.
-- Switching to `Qwen/Qwen2.5-3B-Instruct` + `featherless-ai` provider
-  returned JSON-shaped suggestions, but hit `402 Payment Required` after
-  one call.
+A bare `json.loads` either threw or, worse, returned a dict that silently
+violated the contract the downstream code assumed.
 
-**What changed:**
+**What changed — output validation became a layer, not an afterthought:**
 
-- Registry enrichment, judge, repair, and generator agents now all use
-  the same provider-neutral `StructuredLLMClient`.
-- Gemini is the default (free tier exists, JSON mode is stable).
-- Groq is the open-model backup.
-- HF remains available as an adapter but isn't the default path.
-- Deterministic fallback was added everywhere LLMs are used.
+1. **Lenient extraction**: `_extract_json_object` strips markdown fences
+   and slices from the first `{` to the last `}`, tolerating preamble and
+   trailing prose.
+2. **Pydantic as the gate**: every parsed object is validated against its
+   model (`Plan`, `AssistantTurn`, `JudgeScore`, `RepairPlan`) with
+   `extra="forbid"`, so hallucinated extra keys, missing fields, and
+   type mismatches are rejected — not passed downstream.
+3. **Semantic validation beyond the schema**: the planner's plan is
+   additionally checked against the chain (step count + endpoint match);
+   a structurally-valid-but-wrong plan triggers a retry.
+4. **Retry with error context**: on any parse/validation failure the
+   prompt is re-sent once with the previous error appended, so the model
+   can self-correct.
+5. **Deterministic fallback**: if retries are exhausted, the deterministic
+   agent/path produces a valid result anyway, and the metadata records
+   `last_run = {"path": "fallback", ...}` so the failure is visible.
 
-**Lesson:** prompt quality is not enough if the provider interface is
-brittle. Provider-neutral structured JSON + strict validation +
-deterministic fallback is the load-bearing combination.
+The provider story reinforced the same lesson from a different angle: an
+early registry-enrichment prompt called `google/gemma-4-E2B-it` through a
+Hugging Face chat route that didn't serve it; switching to
+`Qwen/Qwen2.5-3B-Instruct` via `featherless-ai` returned JSON-shaped
+output but hit `402 Payment Required` after one call. So the providers
+were swapped behind one `StructuredLLMClient` (Gemini default, Groq
+backup, others opt-in), and provider errors were contained per-call
+rather than allowed to abort a run.
+
+**Lesson:** with non-frontier models, the prompt instruction "return
+JSON" is necessary but nowhere near sufficient. Reliable structured
+output requires the *output* to be validated, not just requested —
+lenient extraction → Pydantic gate → semantic check → bounded retry →
+deterministic fallback. The prompt asks; the validator proves; the
+fallback guarantees the pipeline still produces a usable result.
 
 ## 12. Output Schema and CLI
 
