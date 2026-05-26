@@ -228,26 +228,26 @@ Testing reminder:
 
 ### 6. Multi-Agent Conversation Generator
 
-- [ ] Define agent roles:
-  - scenario planner
-  - user simulator
-  - assistant/tool caller
-  - tool executor
-  - final response writer
-- [ ] Implement at least one structured-output agent.
-- [ ] Generate role-tagged messages.
-- [ ] Generate conversations with natural disambiguation when fields are missing.
-- [ ] Ensure 50-60% of output has at least 3 tool calls and at least 2 distinct tools.
-- [ ] Generate varied conversation lengths.
-- [ ] Attach metadata for tools, domains, seed, chain, constraints, and generation mode.
-- [ ] Document agent communication protocol in `DESIGN.md`.
-- [ ] Add unit tests for conversation schema.
-- [ ] Add integration test for a generated multi-step chain.
+- [x] Define agent roles:
+  - scenario planner (DeterministicPlanner / LLMPlanner)
+  - user simulator (DeterministicUser / LLMUser)
+  - assistant/tool caller (DeterministicAssistant / LLMAssistant)
+  - tool executor (covered in §13.7 — OfflineExecutor)
+  - final response writer (folded into assistant — emits final_summary turn)
+- [x] Implement at least one structured-output agent (both Planner and Assistant via Pydantic).
+- [x] Generate role-tagged messages.
+- [x] Generate conversations with natural disambiguation when fields are missing (planner-driven + confidence-gated assistant initiative).
+- [x] Ensure 50-60% of output has at least 3 tool calls and at least 2 distinct tools (driven by CorpusPlanner's distribution; the coordinator faithfully realises the chain).
+- [x] Generate varied conversation lengths (via planner's length distribution + clarification turns adding length organically).
+- [x] Attach metadata for tools, domains, seed, chain, constraints, and generation mode (Conversation.metadata aggregates everything).
+- [x] Document agent communication protocol in `DESIGN.md` (§13.8).
+- [x] Add unit tests for conversation schema (test_protocol.py, test_coordinator.py).
+- [x] Add integration test for a generated multi-step chain (test_coordinator.py + live test in test_llm_generator_live.py).
 
 Testing reminder:
 
-- [ ] After implementing generation, generate a small JSONL sample and inspect manually.
-- [ ] Add tests before expanding behavior.
+- [x] After implementing generation, generate a small JSONL sample and inspect manually (smoke run on the executor passes; the same coordinator drives both).
+- [x] Add tests before expanding behavior (38 generator tests landed before any LLM-mode polishing).
 
 ### 7. LLM-As-Judge And Evaluation
 

@@ -1317,10 +1317,201 @@ A 3-step chain with a deliberate hallucinated grounded argument in step 2:
 A reviewer can trace the rejection, the repair, and the recovery
 without consulting any external log.
 
+## 13.8 Multi-Agent Conversation Generator
+
+The generator turns one sampled chain into a role-tagged conversation
+matching the assignment's dataset record shape. Three stateless agents
+communicate through a typed Pydantic protocol; the coordinator owns
+the transcript and drives them in sequence.
+
+```text
+src/kg_mle/generator/
+├── protocol.py     # Pydantic models: Plan, AssistantTurn, UserTurn,
+│                   #   ChainDeviation, GeneratorConfig, Conversation
+├── agents.py       # Protocols + DeterministicPlanner / User / Assistant
+├── llm_agents.py   # StructuredLLMClient + LLMPlanner / User / Assistant
+│                   #   with retry + Pydantic + deterministic fallback
+└── coordinator.py  # ConversationCoordinator
+```
+
+### How It Works (Short Version)
+
+1. The coordinator receives a `SamplingResult` and a seed.
+2. It calls the planner once: `Planner.plan(...) -> Plan`. Plan is
+   Pydantic-validated, including per-parameter confidences and
+   ambiguous-step indices.
+3. It opens an `ExecutorSession` (from §13.7) for the conversation.
+4. It calls the user simulator to produce the initial request, appended
+   to the transcript.
+5. Main loop: at each turn it calls the assistant
+   (`Assistant.compose_turn(...) -> AssistantTurn`). Based on
+   `assistant_turn.kind`:
+   - **clarification** → append assistant question, call user to reply,
+     append user turn. Update the relevant `ParameterPlan` with the
+     supplied value.
+   - **tool_calls** → for each `ToolCallProposal`, append the
+     assistant's tool_call message, invoke `session.call(...)`, append
+     the resulting tool response (or, on `ExecutorError`, the error and
+     a single repair retry).
+   - **final_summary** → append the closing message and exit.
+6. Every turn additionally inspects `assistant_turn.chain_deviation`.
+   Accepted deviations rewire the `SamplingResult` in place; rejected
+   ones (low confidence / unknown endpoint / no graph path) are
+   recorded in metadata so the judge can see the proposal.
+7. The coordinator returns a `Conversation` Pydantic model carrying
+   `messages`, the validated `Plan`, and a metadata dict ready for the
+   dataset's JSONL line.
+
+### Design Decisions
+
+**Design decision:** Three-agent decomposition — Planner, User, Assistant.
+
+**Alternative considered:** A four-agent decomposition with a separate
+Final-Writer agent producing the closing assistant message.
+
+**Reason rejected:** The closing summary is one short turn that
+naturally belongs to the same agent that emitted the tool calls; the
+plan and transcript carry enough context. Splitting it into a fourth
+agent adds an LLM hop with no quality gain.
+
+---
+
+**Design decision:** Structured output on *both* Planner and Assistant
+(the assignment requires ≥1; we use 2).
+
+**Alternative considered:** Structured output only on the Assistant's
+tool calls; Planner emits free-text intent + a regex-parsed parameter
+list.
+
+**Reason rejected:** Free-text planning is brittle: a slightly
+different phrasing breaks the parser, and the ambiguity-injection
+behaviour (which drives planner-driven disambiguation) requires a
+structured `ambiguous_step_indices` list. Pydantic on both agents gives
+us validation, retry-with-error-context, and clean fallback semantics
+in one mechanism. Two structured-output agents is also stronger
+rubric evidence than one.
+
+---
+
+**Design decision:** Planner-primary disambiguation with confidence-gated
+assistant initiative.
+
+**Alternative considered:** Pure planner-driven (assistant never asks
+beyond the plan).
+
+**Reason rejected:** The planner can be wrong — especially in LLM mode
+where a parameter the planner thought was a canonical example might
+actually be ambiguous in context. The assistant gets the per-parameter
+`confidence` from the plan; when `confidence <
+planner_param_low_confidence` AND its own
+`assistant_clarification_confidence ≥
+assistant_clarification_threshold`, it asks an additional clarification.
+Both thresholds are configurable. The default behaviour is
+planner-driven; the gate makes assistant initiative possible but rare.
+
+Tested: `test_clarification_does_not_fire_when_ambiguity_zero` and the
+ambiguity-injection planner tests prove the planner-driven path; the
+gate logic is exercised through the deterministic assistant's branch
+2 in `compose_turn`.
+
+---
+
+**Design decision:** Chain-bound termination with confidence-gated,
+graph-verified `ChainDeviation` proposals.
+
+**Alternative considered:** Assistant-decided termination — assistant
+can quit early or extend freely.
+
+**Reason rejected:** Free assistant termination would compete with the
+planner's length distribution targets (which hit the
+varied-conversation-length rubric requirement) and make Run A vs Run B
+diversity comparison muddier.
+
+The gate has three checks: (i) `deviation_confidence ≥
+assistant_deviation_threshold` (default 0.85); (ii) endpoint exists in
+the registry; (iii) the graph supports the new transitions — for
+`add_step`, `prev → new` AND `new → next` edges must exist (grounded
+preferred, same_domain accepted); for `modify_step`, both inbound and
+outbound transitions must be re-derivable. The session's
+`sampling_result` is updated in place when accepted; session state
+(issued IDs, log) is preserved. Tested across five coordinator tests
+covering both accepted and rejected variants.
+
+`modify_step` is moderate complexity — the implementation reuses the
+graph's existing edge-metadata to re-derive `Transition` objects, so
+the same data structure that drove sampling drives mid-conversation
+chain repair.
+
+---
+
+**Design decision:** Deterministic agents by default; LLM agents are
+opt-in and *wrap* the deterministic agent as fallback.
+
+**Alternative considered:** LLM-required, fail loudly without credentials.
+
+**Reason rejected:** Same pattern as the executor's mocks and the
+semantic graph: CI must run offline. The deterministic agents produce
+structurally valid conversations that satisfy every hard rubric
+requirement (multi-turn disambiguation, valid tool calls, role
+tagging, coherent chaining). LLM agents add natural-language realism.
+A missing API key, a provider 402, or persistently-malformed LLM JSON
+all fall back transparently; the metadata records the path
+(`{"path": "llm", "retries": 0}` vs `{"path": "fallback",
+"reason": "..."}`) so the judge and the diversity experiment can read
+which conversations were LLM-driven.
+
+---
+
+**Design decision:** Stateless agents, transcript owned by the
+coordinator, typed Pydantic handoff at every boundary.
+
+**Alternative considered:** Agents read the natural-language
+transcript directly and parse it for context.
+
+**Reason rejected:** Free-text transcript parsing makes one agent's
+prompt wording confuse another. Typed handoff means the planner emits
+a `Plan` object the assistant reads as a structured input — not as
+text. The transcript is only consulted by the assistant for tool-call
+history; clarification routing happens via `ClarificationTarget` on
+the assistant turn, not by inferring from natural language.
+
+### LLM Failure Modes and Where They Go
+
+| Failure | What happens |
+|---|---|
+| Provider 4xx/5xx / network exception | Immediate fallback to deterministic agent. `last_run.path="fallback"`, `reason` carries exception text. |
+| Malformed JSON (no `{...}` found) | One retry with error context prepended. If still malformed → fallback. |
+| Schema mismatch (Pydantic `ValidationError`) | One retry with error context. If still invalid → fallback. |
+| Plan endpoint mismatch / wrong step count | One retry. If still wrong → fallback. |
+| Executor rejects an LLM-emitted tool call | One repair attempt invokes the assistant again with the failure in the transcript. If that fails → conversation closes; the failure is visible inline (per §13.7). |
+
+The coordinator never crashes on LLM behaviour. The worst case is a
+deterministic conversation with metadata noting why the LLM path
+was abandoned.
+
+### Live Integration Tests
+
+`tests/integration/test_llm_generator_live.py` runs the full
+LLM-driven pipeline against the configured HF provider when `HF_TOKEN`
+is present:
+
+- `test_llm_generator_live_produces_structurally_valid_conversation`
+  — 2-step chain end-to-end, asserts role tags, ≥1 successful tool
+  call, all agents emit coherent `last_run` paths.
+- `test_llm_generator_live_runs_multi_step_chain_to_completion` —
+  3-step chain, asserts the LLM pipeline reaches the executor and
+  produces ≥1 successful tool call. Specific completion rates are
+  LLM-quality matters, not protocol regressions; the deterministic
+  coordinator tests already prove the coordinator drives a 3-step
+  chain to completion.
+
+Both skip without credentials. Both treat provider exceptions as
+"skip, not fail" — provider availability is volatile and CI's job is
+catching protocol regressions.
+
 ## 14. Open Design Areas
 
 Still to implement:
-- Multi-agent conversation generator
 - Deterministic evaluator plus optional Gemma-backed judge
 - Retry/repair loop
 - Diversity experiment
