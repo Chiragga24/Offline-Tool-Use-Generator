@@ -259,6 +259,7 @@ Testing reminder:
 - [x] Implement evaluator interface.
 - [x] Implement deterministic/local judge fallback for offline testability.
 - [x] Optionally support real LLM judge through environment configuration.
+- [x] Add global `--use-llm/--no-use-llm` switch for optional hosted-model behavior.
 - [x] Store judge scores in each evaluation record.
 - [x] Store judge scores in each scored conversation's `metadata.evaluation`.
 - [x] Implement `kgmle evaluate` summary metrics.
@@ -275,25 +276,28 @@ Testing reminder:
 
 ### 8. Retry And Repair
 
-- [ ] Define validation failures:
+- [x] Define validation failures:
   - missing required metadata
   - invalid tool call
   - ungrounded chained argument
   - low judge score
   - malformed message sequence
-- [ ] Implement repair strategy:
+- [x] Implement repair strategy:
   - regenerate missing arguments from prior outputs
   - insert clarification turn when required fields are missing
   - revise final assistant response to match tool outputs
   - rescore repaired conversation
-- [ ] Limit repair attempts.
-- [ ] Preserve repair history in metadata.
-- [ ] Document retry/repair strategy in `DESIGN.md`.
-- [ ] Add integration test demonstrating failure, repair, and pass.
+- [x] Add optional LLM repair planner behind global `--use-llm`.
+- [x] Limit repair attempts.
+- [x] Preserve repair history in metadata.
+- [x] Include repair summary in evaluation metrics.
+- [x] Add `kgmle evaluate --repair`.
+- [x] Document retry/repair strategy in `DESIGN.md`.
+- [x] Add integration test demonstrating failure, repair, and pass.
 
 Testing reminder:
 
-- [ ] The repair test is explicitly required by the assignment. Do not leave it for the end.
+- [x] The repair test is explicitly required by the assignment. Do not leave it for the end.
 
 ### 9. Context Management
 

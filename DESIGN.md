@@ -1631,6 +1631,10 @@ The evaluator follows these design principles:
   `llm_judge.error` field instead of crashing evaluation.
 - **Bounded cost:** `--max-llm-judge-records` limits how many records are sent
   to the hosted judge.
+- **Single LLM switch:** `kgmle --use-llm ...` is the global opt-in for
+  optional hosted-model behavior. Individual legacy flags such as
+  `evaluate --llm-judge` remain supported for targeted runs, but new optional
+  LLM behavior should hang off the global switch.
 - **Provider portability:** the judge uses the same `StructuredLLMClient` as
   generation, so Gemini, Groq, and OpenAI-compatible providers can be swapped
   through `.env`.
@@ -1692,6 +1696,17 @@ errors, not pipeline failures.
 project. A provider error should not invalidate deterministic evaluation or
 block the review workflow.
 
+---
+
+**Design decision:** Use one global `--use-llm/--no-use-llm` CLI switch for
+optional hosted-model behavior.
+
+**Reason:** The project will add optional LLM behavior in multiple places
+(judge, repair planner, and possibly generation polish). A single top-level
+switch avoids a sprawl of unrelated flags and makes runs easier to reproduce.
+The existing `evaluate --llm-judge` flag remains supported for compatibility,
+but `kgmle --use-llm evaluate` is the preferred workflow.
+
 ### Judge Dimensions
 
 The judge dimensions are chosen specifically for training tool-use agents:
@@ -1727,7 +1742,8 @@ visible to the filtering logic.
 Design decision:
 
 - Make deterministic evaluation the default.
-- Make LLM-as-judge opt-in through `--llm-judge`.
+- Make LLM-as-judge opt-in through global `--use-llm`; keep
+  `evaluate --llm-judge` as a compatibility alias.
 - Validate judge output with Pydantic before it is accepted.
 
 Reason:
@@ -1767,7 +1783,180 @@ optional LLM judge result or provider error. The original generated input
 JSONL is not overwritten; `kgmle evaluate` writes a separate scored JSONL so
 reviewers can compare raw vs evaluated artifacts.
 
-## 15. Open Design Areas
+## 15. Retry And Repair
+
+The assignment requires the system to attempt repair when a generated
+conversation fails validation or scores below a quality threshold. Repair is
+implemented as an evaluation-time bounded pass:
+
+```text
+conversation
+-> evaluate
+-> detect validation/quality triggers
+-> create RepairPlan
+-> apply safe deterministic repair or mark coordinator-required repair
+-> re-evaluate once
+-> write repair history into metadata and metrics
+```
+
+Command:
+
+```powershell
+kgmle evaluate --repair --repair-threshold 8.0 --max-repair-attempts 1
+```
+
+Repair module:
+
+```text
+src/kg_mle/repair/
+├── models.py   # RepairTrigger, RepairPlan, RepairResult
+├── policy.py   # thresholds, trigger detection, quality bands
+└── planner.py  # deterministic + LLM repair planners, safe local repairs
+```
+
+### Repair Triggers
+
+Repair is attempted when any of the following are observed:
+
+- schema validation failure
+- role/message validation failure
+- tool error in the trace
+- `deterministic_score < 8.0`
+- `tool_trace_validity < 8.0`
+- `argument_grounding < 8.0`
+- `task_completion < 9.0`
+- `naturalness < 5.0`
+
+The default repair budget is one attempt per conversation.
+
+### Repair Plans
+
+Repair returns a structured plan rather than free-form instructions:
+
+```text
+RepairPlan
+├── strategy
+├── triggers
+├── reason
+├── target_step / target_endpoint
+├── proposed_arguments
+├── proposed_final_response
+├── proposed_chain_change
+├── requires_coordinator
+└── confidence
+```
+
+Current strategies:
+
+- `rewrite_final_response`
+- `apply_graph_verified_chain_change`
+- `regenerate_conversation`
+- `mark_rejected`
+- `fix_tool_arguments`
+- `insert_clarification`
+
+The deterministic planner applies only local safe repairs in the evaluator:
+currently this means final-response rewrites grounded in existing tool
+outputs. Repairs that need the coordinator, executor state, or graph mutation
+are planned and recorded as coordinator-required. This keeps the submitted
+pipeline honest: it attempts repair, records the required action, and does
+not pretend to re-run a stateful conversation when the required state is not
+available in the evaluation artifact.
+
+When the global LLM switch is enabled, the evaluator uses an LLM repair
+planner:
+
+```powershell
+kgmle --use-llm evaluate --repair
+```
+
+The LLM planner still returns the same Pydantic `RepairPlan` schema. If the
+model returns malformed JSON, an invalid strategy, or out-of-range confidence,
+the planner falls back to the deterministic planner. Applying the plan still
+goes through the deterministic repair application layer so hosted-model output
+does not directly mutate conversations.
+
+### Repair Metadata
+
+Every scored conversation includes repair information when a repair was
+attempted:
+
+```text
+metadata.repair_history
+metadata.evaluation.repair
+metadata.evaluation.quality_band
+metadata.evaluation.usable_for_training
+```
+
+The metrics JSON also includes:
+
+```text
+repair_summary
+├── enabled
+├── attempted
+├── repaired
+├── failed
+├── rejected
+├── regenerated
+└── status_counts
+```
+
+Quality bands:
+
+- `gold`: deterministic score >= 9, no tool errors, and no major LLM judge
+  issues when judge scores are present.
+- `silver`: deterministic score >= 8 and no unresolved tool errors.
+- `reject`: validation failure, unresolved tool error, deterministic score <
+  8, or major tool/grounding/task-completion judge failure.
+
+### Repair Design Decisions
+
+**Design decision:** Use a hybrid repair model.
+
+**Reason:** Some issues are best repaired inline during generation, where the
+coordinator has executor state. Others are discovered only after evaluation
+or LLM judging. The current implementation provides the post-generation pass
+and records coordinator-required repairs; future work can hand those plans
+back into the coordinator for full regeneration.
+
+---
+
+**Design decision:** Repair module owns policy and planning; coordinator owns
+stateful application.
+
+**Reason:** The repair module should decide what needs to change. The
+coordinator/executor should apply changes that require conversation state,
+tool outputs, or graph validation. This separation prevents the evaluator
+from duplicating generation logic.
+
+---
+
+**Design decision:** Fixed repair budget of one attempt.
+
+**Reason:** One repair attempt demonstrates the required retry/repair loop
+while bounding hosted-model cost, latency, and nondeterminism.
+
+---
+
+**Design decision:** Deterministic repair first, optional LLM repair planner
+behind global `--use-llm`.
+
+**Reason:** The project is offline-first. Deterministic repair is testable
+without credentials. LLM repair uses the same provider-neutral client and the
+same `RepairPlan` schema, so it can improve planning quality without bypassing
+validation or deterministic application guardrails.
+
+---
+
+**Design decision:** Chain-changing repairs are allowed only when
+graph/coordinator validation can prove them.
+
+**Reason:** Low scores can mean the sampled chain itself is bad, but changing
+chains without graph validation would create new hallucination risk. The
+planner records graph-verified-chain-change as the appropriate strategy,
+but the evaluator does not mutate chains directly.
+
+## 16. Open Design Areas
 
 Still to implement:
 - Diversity experiment

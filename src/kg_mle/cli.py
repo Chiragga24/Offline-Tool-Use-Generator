@@ -39,6 +39,7 @@ from kg_mle.graph import build_tool_graph, save_tool_graph
 from kg_mle.graph.semantic import Mem0SemanticRetriever, SentenceTransformerSemanticRetriever
 from kg_mle.llm import StructuredLLMClient
 from kg_mle.registry import HuggingFaceRegistryEnricher, enrich_registry, load_registry, save_registry
+from kg_mle.repair import LLMRepairPlanner, RepairPolicy
 from kg_mle.sampler import CorpusPlanner, ToolChainSampler
 from kg_mle.utils.logging import configure_logging, get_logger
 from kg_mle.utils.paths import ensure_dir, ensure_parent_dir
@@ -51,6 +52,13 @@ app = typer.Typer(
 )
 console = Console()
 logger = get_logger(__name__)
+
+
+class _CliState:
+    use_llm: bool = False
+
+
+cli_state = _CliState()
 
 
 def version_callback(value: bool) -> None:
@@ -69,8 +77,16 @@ def main(
         str,
         typer.Option("--log-level", help="Logging level."),
     ] = "INFO",
+    use_llm: Annotated[
+        bool,
+        typer.Option(
+            "--use-llm/--no-use-llm",
+            help="Enable optional hosted-LLM features for commands that support them.",
+        ),
+    ] = False,
 ) -> None:
     """Run the KG MLE synthetic data pipeline."""
+    cli_state.use_llm = use_llm
     configure_logging(log_level)
 
 
@@ -282,23 +298,52 @@ def evaluate(
             help="Optional JSONL path for conversations with metadata.evaluation populated.",
         ),
     ] = None,
+    repair: Annotated[
+        bool,
+        typer.Option(
+            "--repair/--no-repair",
+            help="Attempt one bounded deterministic repair pass for failed or low-scoring records.",
+        ),
+    ] = False,
+    repair_threshold: Annotated[
+        float,
+        typer.Option("--repair-threshold", min=0.0, max=10.0, help="Deterministic score repair threshold."),
+    ] = 8.0,
+    max_repair_attempts: Annotated[
+        int,
+        typer.Option("--max-repair-attempts", min=0, max=1, help="Maximum repair attempts per record."),
+    ] = 1,
 ) -> None:
     """Validate generated conversations and compute evaluation metrics."""
     ensure_parent_dir(output)
     logger.info("Evaluate command starting")
     conversations = load_conversations_jsonl(input_path)
     judge = None
-    if llm_judge:
+    use_llm_for_judge = cli_state.use_llm or llm_judge
+    use_llm_for_repair = repair and cli_state.use_llm
+    llm_client = None
+    if use_llm_for_judge or use_llm_for_repair:
         if not DEFAULT_LLM_CONFIG.api_key and DEFAULT_LLM_CONFIG.provider not in {"lmstudio", "vllm"}:
             raise typer.BadParameter(
-                f"--llm-judge requires {DEFAULT_LLM_CONFIG.api_key_env} "
+                f"LLM features require {DEFAULT_LLM_CONFIG.api_key_env} "
                 f"for provider {DEFAULT_LLM_CONFIG.provider!r}."
             )
-        judge = LLMJudge(StructuredLLMClient.from_config(DEFAULT_LLM_CONFIG))
+        llm_client = StructuredLLMClient.from_config(DEFAULT_LLM_CONFIG)
+    if use_llm_for_judge and llm_client is not None:
+        judge = LLMJudge(llm_client)
+    repair_planner = (
+        LLMRepairPlanner(client=llm_client)
+        if use_llm_for_repair and llm_client is not None
+        else None
+    )
     evaluation = evaluate_dataset(
         conversations,
         judge=judge,
         max_judged_records=max_llm_judge_records if judge else None,
+        repair=repair,
+        repair_policy=RepairPolicy(deterministic_threshold=repair_threshold),
+        repair_planner=repair_planner,
+        max_repair_attempts=max_repair_attempts,
     )
     save_evaluation(evaluation, output)
     scored_output_path = scored_output or output.with_name(f"{output.stem}_scored.jsonl")
@@ -309,5 +354,7 @@ def evaluate(
         f"records={summary['conversation_count']} "
         f"mean_score={summary['mean_deterministic_score']} "
         f"llm_judged={summary['llm_judged_count']} "
+        f"use_llm={use_llm_for_judge} "
+        f"repair_attempted={evaluation['repair_summary']['attempted']} "
         f"output={output} scored_output={scored_output_path}"
     )

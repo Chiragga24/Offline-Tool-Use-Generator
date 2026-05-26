@@ -1,6 +1,7 @@
 import json
 
 from kg_mle.evaluation import LLMJudge, evaluate_dataset, load_conversations_jsonl
+from kg_mle.repair import LLMRepairPlanner
 
 
 class _FakeJSONClient:
@@ -93,6 +94,119 @@ def test_evaluate_dataset_attaches_llm_judge_score():
         ]
         == 8.5
     )
+
+
+def test_evaluate_dataset_repair_rewrites_low_naturalness_response():
+    class LowNaturalnessClient(_FakeJSONClient):
+        calls = 0
+
+        def complete_json(self, *, system: str, user: str, temperature: float = 0.0) -> str:
+            self.calls += 1
+            naturalness = 4.0 if self.calls == 1 else 8.0
+            return json.dumps(
+                {
+                    "task_completion": 9.0,
+                    "tool_trace_validity": 9.0,
+                    "argument_grounding": 9.0,
+                    "response_grounding": 9.0,
+                    "naturalness": naturalness,
+                    "overall_score": 8.5,
+                    "confidence": 8.0,
+                    "issues": ["awkward wording"] if naturalness < 5 else [],
+                    "rationale": "Fake score.",
+                }
+            )
+
+    judge = LLMJudge(LowNaturalnessClient())
+
+    evaluation = evaluate_dataset(
+        [_conversation()],
+        judge=judge,
+        max_judged_records=1,
+        repair=True,
+    )
+
+    assert evaluation["repair_summary"]["attempted"] == 1
+    assert evaluation["repair_summary"]["repaired"] == 1
+    scored = evaluation["scored_conversations"][0]
+    assert scored["metadata"]["repair_history"][0]["plan"]["strategy"] == "rewrite_final_response"
+    assert scored["metadata"]["evaluation"]["repair"]["status"] == "repaired"
+    assert scored["metadata"]["evaluation"]["llm_judge"]["naturalness"] == 8.0
+    assert scored["messages"][-2]["role"] == "system"
+    assert scored["messages"][-2]["name"] == "repair"
+
+
+def test_evaluate_dataset_can_use_llm_repair_planner():
+    class LowNaturalnessClient(_FakeJSONClient):
+        calls = 0
+
+        def complete_json(self, *, system: str, user: str, temperature: float = 0.0) -> str:
+            self.calls += 1
+            if "repair planner" in system.lower():
+                return json.dumps(
+                    {
+                        "strategy": "rewrite_final_response",
+                        "reason": "Use a grounded final answer.",
+                        "target_step": None,
+                        "target_endpoint": None,
+                        "proposed_arguments": None,
+                        "proposed_final_response": "Done from the quoted tool result.",
+                        "proposed_chain_change": None,
+                        "requires_coordinator": False,
+                        "confidence": 8.0,
+                    }
+                )
+            naturalness = 4.0 if self.calls == 1 else 8.0
+            return json.dumps(
+                {
+                    "task_completion": 9.0,
+                    "tool_trace_validity": 9.0,
+                    "argument_grounding": 9.0,
+                    "response_grounding": 9.0,
+                    "naturalness": naturalness,
+                    "overall_score": 8.5,
+                    "confidence": 8.0,
+                    "issues": [],
+                    "rationale": "Fake score.",
+                }
+            )
+
+    client = LowNaturalnessClient()
+    judge = LLMJudge(client)
+    repair_planner = LLMRepairPlanner(client=client)
+
+    evaluation = evaluate_dataset(
+        [_conversation()],
+        judge=judge,
+        max_judged_records=1,
+        repair=True,
+        repair_planner=repair_planner,
+    )
+
+    scored = evaluation["scored_conversations"][0]
+    assert repair_planner.last_run["path"] == "llm"
+    assert scored["metadata"]["repair_history"][0]["plan"]["reason"] == "Use a grounded final answer."
+    assert scored["messages"][-1]["content"] == "Done from the quoted tool result."
+
+
+def test_evaluate_dataset_repair_marks_tool_error_as_failed_coordinator_repair():
+    broken = _conversation()
+    broken["messages"].append(
+        {
+            "role": "tool",
+            "endpoint": "finance/get_quote",
+            "content": {"error": {"kind": "ungrounded_argument"}},
+        }
+    )
+
+    evaluation = evaluate_dataset([broken], repair=True)
+
+    assert evaluation["repair_summary"]["attempted"] == 1
+    assert evaluation["repair_summary"]["failed"] == 1
+    scored = evaluation["scored_conversations"][0]
+    assert scored["metadata"]["repair_history"][0]["plan"]["strategy"] == "regenerate_conversation"
+    assert scored["metadata"]["evaluation"]["repair"]["status"] == "failed"
+    assert scored["metadata"]["evaluation"]["usable_for_training"] is False
 
 
 def test_load_conversations_jsonl_skips_blank_lines(tmp_path):

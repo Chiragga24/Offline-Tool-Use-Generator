@@ -27,5 +27,15 @@ default. The scored JSONL contains the original conversations with
 Optional hosted judge:
 
 ```powershell
-kgmle evaluate --llm-judge --max-llm-judge-records 10
+kgmle --use-llm evaluate --max-llm-judge-records 10
+```
+
+`--use-llm` is the global switch for optional hosted-model features. The
+older `evaluate --llm-judge` flag remains supported for judge-only runs.
+
+Optional bounded repair pass:
+
+```powershell
+kgmle evaluate --repair --repair-threshold 8.0
+kgmle --use-llm evaluate --repair --repair-threshold 8.0
 ```
