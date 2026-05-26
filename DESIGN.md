@@ -26,8 +26,10 @@ ToolBench JSON
 ```
 
 **CLI** (`src/kg_mle/cli.py`): `build`, `generate`, `evaluate`, `diversity`,
-plus a global `--use-llm` switch that activates hosted-LLM features
-(registry enrichment, judge, repair planner, generator agents).
+plus a global `--use-llm` switch that activates hosted-LLM features where
+they are supported by the command: registry enrichment, semantic graph
+expansion, LLM generator agents for `generate`, LLM judge, and LLM repair
+planner.
 
 **Scope.** Curated 9-domain, 45-endpoint ToolBench-style fixture
 (`data/sample_toolbench/tools.json`) with intentional schema messiness:
@@ -49,9 +51,9 @@ by default, with all LLM features behind opt-in flags.
 
 Steering widens coverage without hurting quality. Full breakdown in §10.
 
-**Test status:** 178 tests pass without credentials (`pytest -m "not live"`);
-five `@pytest.mark.live` tests run when API keys are present and skip
-cleanly otherwise.
+**Test status:** 182 non-live tests pass without credentials
+(`pytest -m "not live"`); five `@pytest.mark.live` tests run when API
+keys are present and skip cleanly otherwise.
 
 ## 2. Architecture and Communication
 
@@ -520,8 +522,11 @@ Each LLM agent has the same Protocol as its deterministic counterpart
 and falls back per-call on any failure (provider exception, malformed
 JSON, Pydantic validation error, plan/chain shape mismatch). The
 fallback records `last_run = {"path": "fallback", "reason": "..."}`,
-which the coordinator includes in metadata so the judge and the
-diversity experiment can see which conversations were LLM-driven.
+which the coordinator includes in metadata so the judge and downstream
+analysis can see which conversations were LLM-driven. The CLI
+`diversity` command intentionally keeps generation deterministic even
+under `--use-llm`; it uses the hosted model for enrichment and judging,
+not for the Run A/Run B generator itself.
 
 ### LLM failure modes
 
@@ -940,7 +945,7 @@ across commands consistently:
 | `build` | Enables structured-output registry enrichment + semantic graph. |
 | `generate` | Loads built artifacts; uses LLM agents (with deterministic fallback per turn); enables semantic-edge traversal. |
 | `evaluate` | Enables LLM judge; if `--repair` set, also enables LLM repair planner. |
-| `diversity` | All of the above for both Run A and Run B. |
+| `diversity` | Enables structured-output registry enrichment, semantic graph construction, semantic-edge traversal, and LLM judging. Generation remains deterministic so Run A/Run B isolate cross-conversation steering rather than model variance. |
 
 Individual legacy flags (`--llm-judge`, `--llm-enrich-registry`) are
 preserved for targeted runs.
@@ -949,7 +954,7 @@ preserved for targeted runs.
 
 ```text
 tests/fixtures/      sample-fixture validity + intentional messiness
-tests/unit/          178 unit tests across registry, graph, sampler,
+tests/unit/          unit tests across registry, graph, sampler,
                      executor, generator, evaluation, repair, schema,
                      diversity, llm clients
 tests/integration/   CLI smoke + repair + diversity command paths
