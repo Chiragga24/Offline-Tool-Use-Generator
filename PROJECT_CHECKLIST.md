@@ -407,13 +407,13 @@ Testing reminder:
 
 ## Definition Of Done
 
-- [ ] `uv venv .venv` works.
-- [ ] `uv pip install -e ".[dev]"` works.
-- [ ] `kgmle --help` works.
-- [ ] `kgmle build` creates registry and graph artifacts.
-- [ ] `kgmle generate --count 100 --seed 42` creates JSONL dataset.
-- [ ] `kgmle evaluate` creates metrics.
-- [x] `pytest` passes.
+- [x] `uv venv .venv` works. (uv 0.11.6; venv present and functional.)
+- [x] `uv pip install -e ".[dev]"` works. (`uv pip show kg-mle` reports an editable project location at the repo root.)
+- [x] `kgmle --help` works.
+- [x] `kgmle build` creates registry and graph artifacts. (registry.json + tool_graph.json.)
+- [x] `kgmle generate --count 100 --seed 42` creates JSONL dataset. (100 records.)
+- [x] `kgmle evaluate` creates metrics. (conversation_count=100, mean_deterministic_score=10.0, + scored JSONL.)
+- [x] `pytest` passes. (185 non-live tests; 5 live tests skip without credentials.)
 - [x] `README.md` explains the end-to-end workflow.
 - [x] `DESIGN.md` directly answers every required design section from the assignment.
 - [x] Diversity experiment numbers are included.
