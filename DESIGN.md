@@ -2202,7 +2202,171 @@ Implemented tests cover:
 - steering on/off produces different corpora while both runs retain
   comparable counters
 
-## 17. Open Design Areas
+## 17. Diversity Experiment
+
+The diversity experiment compares two corpus-generation runs:
+
+```text
+Run A: cross-conversation steering disabled
+Run B: cross-conversation steering enabled
+```
+
+Both runs use:
+
+- same fixture
+- same seed
+- same target count
+- same deterministic evaluator
+- same optional LLM settings when `--use-llm` is enabled
+
+Planned command:
+
+```powershell
+kgmle diversity --count 100 --seed 42
+kgmle --use-llm diversity --count 100 --seed 42 --max-llm-judge-records 10
+```
+
+Planned artifacts:
+
+```text
+artifacts/diversity/
+├── run_a_no_steering.jsonl
+├── run_b_steering.jsonl
+├── run_a_metrics.json
+├── run_b_metrics.json
+├── run_a_scored.jsonl
+├── run_b_scored.jsonl
+└── diversity_report.json
+```
+
+### Diversity Metrics
+
+The report should include:
+
+- `domain_entropy`: Shannon entropy over domain usage.
+- `endpoint_coverage_ratio`: distinct endpoints used / total endpoints.
+- `tool_coverage_ratio`: distinct tools used / total tools.
+- `distinct_endpoint_pair_ratio`: distinct endpoint pairs / total transitions.
+- `chain_length_distribution`: generated conversation length spread.
+- `domain_pattern_diversity`: number of distinct domain-transition patterns.
+- `top_endpoint_share`: concentration of the most-used endpoint.
+- `mean_deterministic_score`: quality comparison between runs.
+- `repair_attempt_rate`: fraction of records requiring repair.
+- `usable_for_training_rate`: final dataset usability.
+
+### Diversity Design Decisions
+
+**Design decision:** Compare steering on/off with the same seed.
+
+**Reason:** The experiment should isolate the effect of cross-conversation
+steering. Holding seed, count, and fixture constant makes the comparison
+reproducible and defensible.
+
+---
+
+**Design decision:** Use deterministic metrics by default.
+
+**Reason:** The diversity experiment should run offline in a reviewer
+environment. Optional LLM judging can be enabled with `--use-llm`, but the
+core diversity result should not depend on hosted-model availability.
+
+---
+
+**Design decision:** Report diversity and quality together.
+
+**Reason:** Higher diversity is only useful if quality does not collapse.
+The experiment therefore compares coverage/entropy metrics alongside
+deterministic score, repair rate, and usable-for-training rate.
+
+---
+
+**Design decision:** Save both raw and scored datasets for each run.
+
+**Reason:** Raw JSONL lets reviewers inspect generated conversations before
+evaluation. Scored JSONL carries `metadata.evaluation`, quality bands, and
+repair history for filtering and analysis.
+
+---
+
+**Design decision:** Prefer transparent metrics over black-box embedding
+diversity for the submitted MVP.
+
+**Reason:** Domain counts, endpoint coverage, endpoint-pair diversity, and
+entropy are easy to inspect and directly tied to the graph/sampler behavior.
+Embedding diversity can be added later, but it would add another model
+dependency and make the experiment harder to reproduce.
+
+---
+
+**Design decision:** Use the same provider-neutral judge path when
+`--use-llm` is enabled.
+
+**Reason:** The experiment can include qualitative LLM scores without tying
+the implementation to Gemini specifically. Any supported provider can be
+selected through `.env`; `--max-llm-judge-records` bounds cost and latency.
+
+### Diversity Experiment Results
+
+Command:
+
+```powershell
+kgmle diversity --count 100 --seed 42 --output-dir artifacts/diversity
+```
+
+Both runs used the same fixture, seed, count, deterministic evaluator, and no
+LLM judge. The only difference was cross-conversation steering.
+
+| Metric | Run A: no steering | Run B: steering | Delta |
+|---|---:|---:|---:|
+| domain entropy | 2.5304 | 2.7039 | +0.1735 |
+| endpoint coverage ratio | 0.7778 | 0.8889 | +0.1111 |
+| tool coverage ratio | 0.8889 | 1.0000 | +0.1111 |
+| distinct endpoint-pair ratio | 0.3125 | 0.3042 | -0.0083 |
+| domain pattern diversity | 12 | 13 | +1 |
+| top endpoint share | 0.2235 | 0.1912 | -0.0323 |
+| mean deterministic score | 9.9600 | 10.0000 | +0.0400 |
+| chain completion | 0.9900 | 1.0000 | +0.0100 |
+| tool response coverage | 1.0000 | 1.0000 | 0.0000 |
+| schema valid rate | 1.0000 | 1.0000 | 0.0000 |
+| usable-for-training rate | 0.9900 | 1.0000 | +0.0100 |
+
+Interpretation:
+
+- Steering improved broad coverage: more endpoints, all tools, higher domain
+  entropy, and one additional domain pattern.
+- Steering reduced concentration: the most-used endpoint's share dropped from
+  22.35% to 19.12%.
+- Distinct endpoint-pair ratio decreased slightly, which is acceptable here
+  because the steered run generated more total transitions while preserving
+  high quality. Pair-level forbidding is currently diagnostic rather than an
+  active walker constraint.
+- Quality did not degrade. The steered run had perfect deterministic score,
+  chain completion, schema validity, and usable-for-training rate.
+
+Artifacts:
+
+```text
+artifacts/diversity/run_a_no_steering.jsonl
+artifacts/diversity/run_b_steering.jsonl
+artifacts/diversity/run_a_metrics.json
+artifacts/diversity/run_b_metrics.json
+artifacts/diversity/run_a_scored.jsonl
+artifacts/diversity/run_b_scored.jsonl
+artifacts/diversity/diversity_report.json
+```
+
+### Diversity Experiment Limitations
+
+- The curated fixture is small, so diversity metrics are meaningful for
+  relative comparison but not a claim about full ToolBench coverage.
+- The sampler still works over an in-memory graph; full ToolBench scale may
+  need indexed graph traversal and cached semantic neighbors.
+- Endpoint-pair overuse is currently diagnostic; direct pair-level forbidding
+  is future work.
+- Optional LLM judging introduces provider variance, so deterministic quality
+  metrics remain the primary comparison.
+
+## 18. Open Design Areas
 
 Still to implement:
 - Diversity experiment

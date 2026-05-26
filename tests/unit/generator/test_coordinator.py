@@ -99,6 +99,7 @@ def test_metadata_summarises_run(pipeline):
     assert md["final_chain"] == list(chain.endpoints)
     assert "advance_type_counts" in md
     assert "transition_summary" in md
+    assert md["tools_visited"] == list(chain.metadata["tools_visited"])
     assert md["seed"] == 42
 
 

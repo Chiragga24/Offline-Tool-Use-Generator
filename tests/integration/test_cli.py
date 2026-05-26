@@ -17,6 +17,7 @@ def test_cli_help_shows_commands():
     assert "build" in result.output
     assert "generate" in result.output
     assert "evaluate" in result.output
+    assert "diversity" in result.output
     assert "--use-llm" in result.output
 
 
@@ -331,3 +332,98 @@ def test_global_use_llm_wires_llm_repair_planner(tmp_path, monkeypatch):
     assert _FakeRepairPlanner.used is True
     scored = json.loads(scored_output.read_text(encoding="utf-8").strip())
     assert scored["metadata"]["repair_history"][0]["plan"]["reason"] == "Fake LLM planner used."
+
+
+def test_diversity_command_writes_expected_artifacts(tmp_path):
+    output_dir = tmp_path / "diversity"
+
+    result = runner.invoke(
+        app,
+        [
+            "diversity",
+            "--count",
+            "4",
+            "--seed",
+            "5",
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "diversity experiment complete" in result.output
+    expected = [
+        "run_a_no_steering.jsonl",
+        "run_b_steering.jsonl",
+        "run_a_metrics.json",
+        "run_b_metrics.json",
+        "run_a_scored.jsonl",
+        "run_b_scored.jsonl",
+        "diversity_report.json",
+    ]
+    for name in expected:
+        assert (output_dir / name).exists(), f"missing {name}"
+    report = json.loads((output_dir / "diversity_report.json").read_text(encoding="utf-8"))
+    assert report["config"]["count"] == 4
+    assert "endpoint_coverage_delta" in report["comparison"]
+
+
+def test_diversity_use_llm_wires_provider_neutral_judge(tmp_path, monkeypatch):
+    output_dir = tmp_path / "diversity_llm"
+
+    class _FakeConfig:
+        provider = "gemini"
+        api_key_env = "GOOGLE_API_KEY"
+        api_key = "test-key"
+
+    class _FakeClient:
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+    class _FakeJudge:
+        def __init__(self, client):
+            pass
+
+        def score(self, conversation):
+            class _Score:
+                def model_dump(self):
+                    return {
+                        "task_completion": 10.0,
+                        "tool_trace_validity": 10.0,
+                        "argument_grounding": 10.0,
+                        "response_grounding": 10.0,
+                        "naturalness": 10.0,
+                        "overall_score": 10.0,
+                        "confidence": 10.0,
+                        "issues": [],
+                        "rationale": "Fake diversity judge score.",
+                    }
+
+            return _Score()
+
+    monkeypatch.setattr("kg_mle.cli.DEFAULT_LLM_CONFIG", _FakeConfig())
+    monkeypatch.setattr("kg_mle.cli.StructuredLLMClient", _FakeClient)
+    monkeypatch.setattr("kg_mle.cli.LLMJudge", _FakeJudge)
+
+    result = runner.invoke(
+        app,
+        [
+            "--use-llm",
+            "diversity",
+            "--count",
+            "2",
+            "--seed",
+            "5",
+            "--output-dir",
+            str(output_dir),
+            "--max-llm-judge-records",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    report = json.loads((output_dir / "diversity_report.json").read_text(encoding="utf-8"))
+    assert report["config"]["llm_judge_enabled"] is True
+    assert report["run_a_no_steering"]["quality"]["llm_judged_count"] == 1
+    assert report["run_b_steering"]["quality"]["llm_judged_count"] == 1

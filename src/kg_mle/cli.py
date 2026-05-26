@@ -20,6 +20,7 @@ from kg_mle.config import (
     DEFAULT_SEMANTIC_THRESHOLD,
     DEFAULT_SEMANTIC_TOP_K,
 )
+from kg_mle.diversity import DiversityRunConfig, run_diversity_experiment
 from kg_mle.evaluation import (
     LLMJudge,
     evaluate_dataset,
@@ -357,4 +358,59 @@ def evaluate(
         f"use_llm={use_llm_for_judge} "
         f"repair_attempted={evaluation['repair_summary']['attempted']} "
         f"output={output} scored_output={scored_output_path}"
+    )
+
+
+@app.command()
+def diversity(
+    count: Annotated[
+        int,
+        typer.Option("--count", "-n", min=1, help="Number of conversations per run."),
+    ] = 100,
+    seed: Annotated[int, typer.Option("--seed", help="Shared random seed for both runs.")] = 42,
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", "-o", help="Directory for diversity artifacts."),
+    ] = DEFAULT_ARTIFACTS_DIR / "diversity",
+    repair: Annotated[
+        bool,
+        typer.Option("--repair/--no-repair", help="Run deterministic repair during evaluation."),
+    ] = False,
+    max_llm_judge_records: Annotated[
+        int,
+        typer.Option(
+            "--max-llm-judge-records",
+            min=1,
+            help="Maximum records per run to send to the live LLM judge when --use-llm is set.",
+        ),
+    ] = 10,
+) -> None:
+    """Compare generation with steering disabled vs enabled."""
+    logger.info("Diversity command starting")
+    judge = None
+    if cli_state.use_llm:
+        if not DEFAULT_LLM_CONFIG.api_key and DEFAULT_LLM_CONFIG.provider not in {"lmstudio", "vllm"}:
+            raise typer.BadParameter(
+                f"LLM features require {DEFAULT_LLM_CONFIG.api_key_env} "
+                f"for provider {DEFAULT_LLM_CONFIG.provider!r}."
+            )
+        judge = LLMJudge(StructuredLLMClient.from_config(DEFAULT_LLM_CONFIG))
+    report = run_diversity_experiment(
+        DiversityRunConfig(
+            count=count,
+            seed=seed,
+            output_dir=output_dir,
+            input_path=DEFAULT_INPUT_PATH,
+            repair=repair,
+            judge=judge,
+            max_llm_judge_records=max_llm_judge_records if judge else None,
+        )
+    )
+    comparison = report["comparison"]
+    console.print(
+        "[green]diversity experiment complete[/green]: "
+        f"count={count} seed={seed} "
+        f"endpoint_coverage_delta={comparison['endpoint_coverage_delta']} "
+        f"domain_entropy_delta={comparison['domain_entropy_delta']} "
+        f"report={output_dir / 'diversity_report.json'}"
     )

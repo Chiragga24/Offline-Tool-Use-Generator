@@ -609,6 +609,7 @@ def _metadata_dict(
         "final_chain": final_chain,
         "n_tool_calls": len(final_chain),
         "domains": sorted({eid.split("/", 1)[0] for eid in final_chain}),
+        "tools_visited": list(sampling_result.metadata.get("tools_visited", [])),
         "advance_type_counts": dict(meta.advance_type_counts),
         "clarifications_taken": meta.clarifications_taken,
         "repair_attempts": meta.repair_attempts,

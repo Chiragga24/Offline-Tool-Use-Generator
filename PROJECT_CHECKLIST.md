@@ -319,18 +319,24 @@ Testing reminder:
 
 ### 10. Diversity Experiment
 
-- [ ] Add CLI flag: `--no-cross-conversation-steering`.
-- [ ] Generate Run A with steering disabled and fixed seed.
-- [ ] Generate Run B with steering enabled and same seed.
-- [ ] Compute at least two diversity metrics:
+- [x] Add CLI flag: `--no-cross-conversation-steering`.
+- [ ] Add `kgmle diversity` command.
+- [x] Add `kgmle diversity` command.
+- [x] Generate Run A with steering disabled and fixed seed.
+- [x] Generate Run B with steering enabled and same seed.
+- [x] Compute diversity metrics:
   - domain entropy
   - distinct endpoint-pair ratio
   - tool coverage ratio
   - chain-pattern diversity
-- [ ] Measure quality scores for both runs.
-- [ ] Save numeric results to artifact files.
-- [ ] Add `DESIGN.md` section: "Diversity & Quality Analysis".
-- [ ] Analyze whether diversity improved and whether quality changed.
+- [x] Compute quality comparison metrics:
+  - mean deterministic score
+  - repair attempt rate
+  - usable-for-training rate
+- [x] Measure quality scores for both runs.
+- [x] Save numeric results to artifact files.
+- [x] Add `DESIGN.md` section: "Diversity Experiment".
+- [x] Analyze whether diversity improved and whether quality changed.
 
 Testing reminder:
 

@@ -39,3 +39,10 @@ Optional bounded repair pass:
 kgmle evaluate --repair --repair-threshold 8.0
 kgmle --use-llm evaluate --repair --repair-threshold 8.0
 ```
+
+Diversity experiment:
+
+```powershell
+kgmle diversity --count 100 --seed 42
+kgmle --use-llm diversity --count 100 --seed 42 --max-llm-judge-records 10
+```
