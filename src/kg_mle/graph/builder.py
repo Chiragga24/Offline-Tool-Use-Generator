@@ -132,6 +132,11 @@ def save_tool_graph(graph: ToolGraph, output_path: Path | str) -> Path:
     return path
 
 
+def load_tool_graph(input_path: Path | str) -> ToolGraph:
+    path = Path(input_path)
+    return ToolGraph.model_validate_json(path.read_text(encoding="utf-8"))
+
+
 def endpoint_card(endpoint: Endpoint) -> EndpointCard:
     inputs = ", ".join(parameter.name for parameter in endpoint.parameters) or "none"
     outputs = ", ".join(field.name for field in endpoint.response_fields) or "unknown"

@@ -36,10 +36,16 @@ from kg_mle.generator import (
     DeterministicUser,
     GeneratorConfig,
 )
-from kg_mle.graph import build_tool_graph, save_tool_graph
+from kg_mle.graph import build_tool_graph, load_tool_graph, save_tool_graph
 from kg_mle.graph.semantic import Mem0SemanticRetriever, SentenceTransformerSemanticRetriever
 from kg_mle.llm import StructuredLLMClient
-from kg_mle.registry import HuggingFaceRegistryEnricher, enrich_registry, load_registry, save_registry
+from kg_mle.registry import (
+    StructuredLLMRegistryEnricher,
+    enrich_registry,
+    load_normalized_registry,
+    load_registry,
+    save_registry,
+)
 from kg_mle.repair import LLMRepairPlanner, RepairPolicy
 from kg_mle.sampler import CorpusPlanner, ToolChainSampler
 from kg_mle.utils.logging import configure_logging, get_logger
@@ -89,6 +95,62 @@ def main(
     """Run the KG MLE synthetic data pipeline."""
     cli_state.use_llm = use_llm
     configure_logging(log_level)
+
+
+def _llm_client_or_error(feature_name: str) -> StructuredLLMClient:
+    if not DEFAULT_LLM_CONFIG.api_key and DEFAULT_LLM_CONFIG.provider not in {"lmstudio", "vllm"}:
+        raise typer.BadParameter(
+            f"LLM {feature_name} requires {DEFAULT_LLM_CONFIG.api_key_env} "
+            f"for provider {DEFAULT_LLM_CONFIG.provider!r}."
+        )
+    return StructuredLLMClient.from_config(DEFAULT_LLM_CONFIG)
+
+
+def _semantic_retriever(semantic_backend: str):
+    if semantic_backend == "mem0":
+        return Mem0SemanticRetriever(
+            embedding_provider=DEFAULT_EMBEDDING_PROVIDER,
+            embedding_model=DEFAULT_EMBEDDING_MODEL,
+            llm_provider=DEFAULT_MEM0_LLM_CONFIG.provider,
+            llm_model=DEFAULT_MEM0_LLM_CONFIG.model,
+            llm_api_key=DEFAULT_MEM0_LLM_CONFIG.api_key,
+            llm_base_url=DEFAULT_MEM0_LLM_CONFIG.base_url,
+        )
+    if semantic_backend == "local":
+        return SentenceTransformerSemanticRetriever(model_name=DEFAULT_EMBEDDING_MODEL)
+    raise typer.BadParameter("semantic backend must be one of: local, mem0")
+
+
+def _load_or_build_registry_and_graph(
+    *,
+    artifacts_dir: Path,
+    semantic_graph: bool,
+    semantic_backend: str,
+):
+    registry_path = artifacts_dir / DEFAULT_REGISTRY_PATH.name
+    graph_path = artifacts_dir / DEFAULT_GRAPH_PATH.name
+    if registry_path.exists() and graph_path.exists():
+        return load_normalized_registry(registry_path), load_tool_graph(graph_path)
+
+    registry = load_registry(DEFAULT_INPUT_PATH)
+    registry_enricher = (
+        StructuredLLMRegistryEnricher(client=_llm_client_or_error("registry enrichment"))
+        if cli_state.use_llm
+        else None
+    )
+    enrich_registry(
+        registry,
+        enricher=registry_enricher,
+        max_llm_endpoints=5 if registry_enricher else None,
+    )
+    semantic = _semantic_retriever(semantic_backend) if semantic_graph else None
+    graph = build_tool_graph(
+        registry,
+        semantic_retriever=semantic,
+        semantic_threshold=DEFAULT_SEMANTIC_THRESHOLD,
+        semantic_top_k=DEFAULT_SEMANTIC_TOP_K,
+    )
+    return registry, graph
 
 
 @app.command()
@@ -162,15 +224,10 @@ def build(
     enrichment_report = None
     if enrich_registry_fields:
         registry_enricher = None
-        if llm_enrich_registry:
-            if DEFAULT_LLM_CONFIG.provider != "huggingface":
-                raise typer.BadParameter(
-                    "registry LLM enrichment currently supports KG_MLE_LLM_PROVIDER=huggingface"
-                )
-            registry_enricher = HuggingFaceRegistryEnricher(
-                model=DEFAULT_LLM_CONFIG.model,
-                api_key=DEFAULT_LLM_CONFIG.api_key,
-                provider=DEFAULT_LLM_CONFIG.extra.get("hf_provider"),
+        effective_llm_enrich = llm_enrich_registry or cli_state.use_llm
+        if effective_llm_enrich:
+            registry_enricher = StructuredLLMRegistryEnricher(
+                client=_llm_client_or_error("registry enrichment")
             )
         enrichment_report = enrich_registry(
             registry,
@@ -180,21 +237,8 @@ def build(
         )
     registry_path = artifacts_dir / DEFAULT_REGISTRY_PATH.name
     save_registry(registry, registry_path)
-    semantic_retriever = None
-    if semantic_graph:
-        if semantic_backend == "mem0":
-            semantic_retriever = Mem0SemanticRetriever(
-                embedding_provider=DEFAULT_EMBEDDING_PROVIDER,
-                embedding_model=DEFAULT_EMBEDDING_MODEL,
-                llm_provider=DEFAULT_MEM0_LLM_CONFIG.provider,
-                llm_model=DEFAULT_MEM0_LLM_CONFIG.model,
-                llm_api_key=DEFAULT_MEM0_LLM_CONFIG.api_key,
-                llm_base_url=DEFAULT_MEM0_LLM_CONFIG.base_url,
-            )
-        elif semantic_backend == "local":
-            semantic_retriever = SentenceTransformerSemanticRetriever(model_name=DEFAULT_EMBEDDING_MODEL)
-        else:
-            raise typer.BadParameter("semantic backend must be one of: local, mem0")
+    effective_semantic_graph = semantic_graph or cli_state.use_llm
+    semantic_retriever = _semantic_retriever(semantic_backend) if effective_semantic_graph else None
     graph = build_tool_graph(
         registry,
         semantic_retriever=semantic_retriever,
@@ -207,6 +251,7 @@ def build(
         "[green]built artifacts[/green]: "
         f"tools={len(registry.tools)} endpoints={registry.endpoint_count()} "
         f"nodes={graph.node_count()} edges={graph.edge_count()} "
+        f"semantic_edges={graph.edge_count('semantic_related')} "
         f"registry_enrichments={len(enrichment_report.accepted) if enrichment_report else 0} "
         f"registry={registry_path} graph={graph_path}"
     )
@@ -220,6 +265,28 @@ def generate(
         Path,
         typer.Option("--output", "-o", help="Output JSONL path."),
     ] = DEFAULT_DATASET_PATH,
+    artifacts_dir: Annotated[
+        Path,
+        typer.Option("--artifacts-dir", "-a", help="Directory containing build artifacts."),
+    ] = DEFAULT_ARTIFACTS_DIR,
+    semantic_graph: Annotated[
+        bool,
+        typer.Option(
+            "--semantic-graph/--no-semantic-graph",
+            help="Build semantic graph on the fly if graph artifact is missing.",
+        ),
+    ] = False,
+    semantic_backend: Annotated[
+        str,
+        typer.Option("--semantic-backend", help="Semantic backend: local or mem0."),
+    ] = DEFAULT_SEMANTIC_BACKEND,
+    allow_semantic_edges: Annotated[
+        bool,
+        typer.Option(
+            "--allow-semantic-edges/--no-allow-semantic-edges",
+            help="Allow the sampler to traverse semantic_related graph edges.",
+        ),
+    ] = False,
     cross_conversation_steering: Annotated[
         bool,
         typer.Option(
@@ -231,14 +298,18 @@ def generate(
     """Generate synthetic tool-use conversations."""
     ensure_parent_dir(output)
     logger.info("Generate command starting")
-    registry = load_registry(DEFAULT_INPUT_PATH)
-    enrich_registry(registry)
-    graph = build_tool_graph(registry)
+    registry, graph = _load_or_build_registry_and_graph(
+        artifacts_dir=artifacts_dir,
+        semantic_graph=semantic_graph or cli_state.use_llm,
+        semantic_backend=semantic_backend,
+    )
     sampler = ToolChainSampler(graph)
+    effective_allow_semantic = allow_semantic_edges or cli_state.use_llm
     report = CorpusPlanner(
         sampler,
         steering_enabled=cross_conversation_steering,
         seed=seed,
+        allow_semantic_edges=effective_allow_semantic,
     ).sample_corpus(count)
     executor = OfflineExecutor(registry)
     config = GeneratorConfig()
@@ -263,7 +334,9 @@ def generate(
         "[green]generated dataset[/green]: "
         f"requested={count} records={len(report.results)} failures={len(report.failures)} "
         f"seed={seed} output={output} "
-        f"cross_conversation_steering={cross_conversation_steering}"
+        f"cross_conversation_steering={cross_conversation_steering} "
+        f"semantic_edges_in_graph={graph.edge_count('semantic_related')} "
+        f"semantic_edges_allowed={effective_allow_semantic}"
     )
 
 
@@ -372,6 +445,24 @@ def diversity(
         Path,
         typer.Option("--output-dir", "-o", help="Directory for diversity artifacts."),
     ] = DEFAULT_ARTIFACTS_DIR / "diversity",
+    semantic_graph: Annotated[
+        bool,
+        typer.Option(
+            "--semantic-graph/--no-semantic-graph",
+            help="Enable semantic graph expansion for both diversity runs.",
+        ),
+    ] = False,
+    semantic_backend: Annotated[
+        str,
+        typer.Option("--semantic-backend", help="Semantic backend: local or mem0."),
+    ] = DEFAULT_SEMANTIC_BACKEND,
+    allow_semantic_edges: Annotated[
+        bool,
+        typer.Option(
+            "--allow-semantic-edges/--no-allow-semantic-edges",
+            help="Allow the sampler to traverse semantic_related graph edges.",
+        ),
+    ] = False,
     repair: Annotated[
         bool,
         typer.Option("--repair/--no-repair", help="Run deterministic repair during evaluation."),
@@ -394,7 +485,14 @@ def diversity(
                 f"LLM features require {DEFAULT_LLM_CONFIG.api_key_env} "
                 f"for provider {DEFAULT_LLM_CONFIG.provider!r}."
             )
-        judge = LLMJudge(StructuredLLMClient.from_config(DEFAULT_LLM_CONFIG))
+        judge = LLMJudge(_llm_client_or_error("judge"))
+    effective_semantic_graph = semantic_graph or cli_state.use_llm
+    effective_allow_semantic = allow_semantic_edges or cli_state.use_llm
+    registry_enricher = (
+        StructuredLLMRegistryEnricher(client=_llm_client_or_error("registry enrichment"))
+        if cli_state.use_llm
+        else None
+    )
     report = run_diversity_experiment(
         DiversityRunConfig(
             count=count,
@@ -404,6 +502,11 @@ def diversity(
             repair=repair,
             judge=judge,
             max_llm_judge_records=max_llm_judge_records if judge else None,
+            semantic_graph=effective_semantic_graph,
+            semantic_backend=semantic_backend,
+            allow_semantic_edges=effective_allow_semantic,
+            registry_enricher=registry_enricher,
+            llm_registry_enrichment=registry_enricher is not None,
         )
     )
     comparison = report["comparison"]
@@ -412,5 +515,8 @@ def diversity(
         f"count={count} seed={seed} "
         f"endpoint_coverage_delta={comparison['endpoint_coverage_delta']} "
         f"domain_entropy_delta={comparison['domain_entropy_delta']} "
+        f"semantic_graph={effective_semantic_graph} "
+        f"semantic_edges_allowed={effective_allow_semantic} "
+        f"llm_registry_enrichment={registry_enricher is not None} "
         f"report={output_dir / 'diversity_report.json'}"
     )

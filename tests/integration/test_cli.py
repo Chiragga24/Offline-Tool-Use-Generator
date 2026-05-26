@@ -47,6 +47,48 @@ def test_build_command_writes_registry_and_graph(tmp_path):
     assert (tmp_path / "tool_graph.json").exists()
 
 
+def test_build_use_llm_enables_provider_neutral_registry_enrichment(tmp_path, monkeypatch):
+    class _FakeConfig:
+        provider = "gemini"
+        api_key_env = "GOOGLE_API_KEY"
+        api_key = "test-key"
+
+    class _FakeEnricher:
+        used = False
+
+        def __init__(self, client):
+            _FakeEnricher.used = True
+
+        def suggest(self, endpoint):
+            return []
+
+    class _FakeClient:
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+    monkeypatch.setattr("kg_mle.cli.DEFAULT_LLM_CONFIG", _FakeConfig())
+    monkeypatch.setattr("kg_mle.cli.StructuredLLMClient", _FakeClient)
+    monkeypatch.setattr("kg_mle.cli.StructuredLLMRegistryEnricher", _FakeEnricher)
+    monkeypatch.setattr("kg_mle.cli._semantic_retriever", lambda backend: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "--use-llm",
+            "build",
+            "--input",
+            "data/sample_toolbench/tools.json",
+            "--artifacts-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert _FakeEnricher.used is True
+    assert "semantic_edges=0" in result.output
+
+
 def test_generate_command_writes_dataset_and_exposes_steering_toggle(tmp_path):
     output = tmp_path / "conversations.jsonl"
     result = runner.invoke(
@@ -68,6 +110,41 @@ def test_generate_command_writes_dataset_and_exposes_steering_toggle(tmp_path):
     assert "cross_conversation_steering=False" in result.output
     assert output.exists()
     assert len(output.read_text(encoding="utf-8").strip().splitlines()) == 1
+
+
+def test_generate_uses_built_artifacts_and_allows_semantic_edges(tmp_path):
+    build_result = runner.invoke(
+        app,
+        [
+            "build",
+            "--input",
+            "data/sample_toolbench/tools.json",
+            "--artifacts-dir",
+            str(tmp_path),
+        ],
+    )
+    assert build_result.exit_code == 0
+    output = tmp_path / "conversations.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "generate",
+            "--count",
+            "1",
+            "--seed",
+            "7",
+            "--artifacts-dir",
+            str(tmp_path),
+            "--allow-semantic-edges",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "semantic_edges_allowed=True" in result.output
+    assert output.exists()
 
 
 def test_evaluate_command_writes_metrics(tmp_path):
@@ -402,9 +479,18 @@ def test_diversity_use_llm_wires_provider_neutral_judge(tmp_path, monkeypatch):
 
             return _Score()
 
+    class _FakeEnricher:
+        def __init__(self, client):
+            pass
+
+        def suggest(self, endpoint):
+            return []
+
     monkeypatch.setattr("kg_mle.cli.DEFAULT_LLM_CONFIG", _FakeConfig())
     monkeypatch.setattr("kg_mle.cli.StructuredLLMClient", _FakeClient)
     monkeypatch.setattr("kg_mle.cli.LLMJudge", _FakeJudge)
+    monkeypatch.setattr("kg_mle.cli.StructuredLLMRegistryEnricher", _FakeEnricher)
+    monkeypatch.setattr("kg_mle.diversity.experiment._semantic_retriever", lambda config: None)
 
     result = runner.invoke(
         app,
@@ -425,5 +511,8 @@ def test_diversity_use_llm_wires_provider_neutral_judge(tmp_path, monkeypatch):
     assert result.exit_code == 0
     report = json.loads((output_dir / "diversity_report.json").read_text(encoding="utf-8"))
     assert report["config"]["llm_judge_enabled"] is True
+    assert report["config"]["semantic_graph"] is True
+    assert report["config"]["allow_semantic_edges"] is True
+    assert report["config"]["llm_registry_enrichment"] is True
     assert report["run_a_no_steering"]["quality"]["llm_judged_count"] == 1
     assert report["run_b_steering"]["quality"]["llm_judged_count"] == 1

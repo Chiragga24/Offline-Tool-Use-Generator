@@ -1,6 +1,6 @@
 """Tool graph construction."""
 
-from kg_mle.graph.builder import build_tool_graph, endpoint_card, save_tool_graph
+from kg_mle.graph.builder import build_tool_graph, endpoint_card, load_tool_graph, save_tool_graph
 from kg_mle.graph.models import EdgeType, GraphEdge, GraphNode, NodeType, ToolGraph
 from kg_mle.graph.semantic import (
     EndpointCard,
@@ -21,5 +21,6 @@ __all__ = [
     "ToolGraph",
     "build_tool_graph",
     "endpoint_card",
+    "load_tool_graph",
     "save_tool_graph",
 ]

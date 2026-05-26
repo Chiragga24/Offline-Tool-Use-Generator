@@ -34,6 +34,11 @@ def load_registry(input_path: Path | str) -> ToolRegistry:
     return normalize_tools(raw_tools)
 
 
+def load_normalized_registry(input_path: Path | str) -> ToolRegistry:
+    path = Path(input_path)
+    return ToolRegistry.model_validate_json(path.read_text(encoding="utf-8"))
+
+
 def normalize_tools(raw_tools: list[dict[str, Any]]) -> ToolRegistry:
     tools: list[Tool] = []
     seen_endpoint_ids: dict[str, str] = {}
@@ -292,4 +297,3 @@ def _normalize_domain(category: str) -> str:
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_")
     return slug or "unknown"
-

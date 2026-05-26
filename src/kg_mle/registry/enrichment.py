@@ -3,6 +3,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from kg_mle.llm.clients import StructuredLLMClient
 from kg_mle.registry.models import Endpoint, ParameterType, ToolRegistry
 
 
@@ -191,6 +192,49 @@ class HuggingFaceRegistryEnricher:
             return_full_text=False,
         )
         return str(response)
+
+
+class StructuredLLMRegistryEnricher:
+    """Provider-neutral registry enricher using the project LLM client."""
+
+    def __init__(
+        self,
+        *,
+        client: StructuredLLMClient,
+        max_unresolved_fields: int = 8,
+    ) -> None:
+        self._client = client
+        self.max_unresolved_fields = max_unresolved_fields
+
+    def suggest(self, endpoint: Endpoint) -> list[FieldEnrichmentSuggestion]:
+        unresolved = unresolved_fields(endpoint)[: self.max_unresolved_fields]
+        if not unresolved:
+            return []
+
+        content = self._client.complete_json(
+            system=(
+                "You normalize API schema fields. Return only valid JSON. "
+                "Do not include markdown fences."
+            ),
+            user=_build_enrichment_prompt(endpoint, unresolved),
+            temperature=0.0,
+        )
+        payload = _extract_json_object(content)
+        raw_suggestions = payload.get("suggestions", [])
+        if not isinstance(raw_suggestions, list):
+            return []
+
+        suggestions: list[FieldEnrichmentSuggestion] = []
+        for raw in raw_suggestions:
+            if not isinstance(raw, dict):
+                continue
+            raw.setdefault("endpoint_id", endpoint.endpoint_id)
+            raw.setdefault("source", "llm")
+            try:
+                suggestions.append(FieldEnrichmentSuggestion.model_validate(raw))
+            except ValidationError:
+                continue
+        return suggestions
 
 
 def enrich_registry(

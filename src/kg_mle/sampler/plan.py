@@ -76,6 +76,7 @@ class CorpusPlanner:
         length_distribution: tuple[tuple[int, float], ...] = _DEFAULT_LENGTH_DISTRIBUTION,
         multi_step_fraction: float = 0.55,
         max_relaxation_attempts: int = 8,
+        allow_semantic_edges: bool = False,
     ) -> None:
         self._sampler = sampler
         self._seed = seed
@@ -83,6 +84,7 @@ class CorpusPlanner:
         self._length_distribution = length_distribution
         self._multi_step_fraction = multi_step_fraction
         self._max_relaxation_attempts = max_relaxation_attempts
+        self._allow_semantic_edges = allow_semantic_edges
         self._available_domains = tuple(sorted(sampler._endpoints_by_domain.keys()))
 
     def sample_corpus(self, target_count: int) -> CorpusReport:
@@ -107,6 +109,7 @@ class CorpusPlanner:
             "length_distribution": list(self._length_distribution),
             "multi_step_fraction": self._multi_step_fraction,
             "endpoint_overuse_threshold": steerer.endpoint_overuse_threshold,
+            "allow_semantic_edges": self._allow_semantic_edges,
         }
 
         for plan_index in range(target_count):
@@ -157,6 +160,7 @@ class CorpusPlanner:
             min_distinct_domains=min_distinct_domains,
             required_domains=required_domains,
             min_grounded_transitions=min_grounded,
+            allow_semantic_edges=self._allow_semantic_edges,
             forbid_endpoint_ids=steerer.forbid_endpoints(),
         )
 

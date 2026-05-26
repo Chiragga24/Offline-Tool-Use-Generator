@@ -1956,7 +1956,140 @@ chains without graph validation would create new hallucination risk. The
 planner records graph-verified-chain-change as the appropriate strategy,
 but the evaluator does not mutate chains directly.
 
-## 16. Context Management
+## 16. Prompt Design
+
+Hosted-model usage is optional, but when enabled the project uses structured
+prompts and Pydantic validation instead of accepting free-form LLM text.
+
+### Planner Prompt
+
+The planner prompt receives:
+
+- sampled tool chain
+- endpoint schemas
+- required parameters
+- ambiguity policy
+- output schema for `Plan`
+
+It must return a JSON object that validates as:
+
+```text
+Plan
+├── conversation_intent
+├── user_character
+├── plan_confidence
+├── step_plans
+└── ambiguous_step_indices
+```
+
+Design decision:
+
+- Ask the planner for parameter plans and ambiguity flags, not final
+  conversation text.
+
+Reason:
+
+- The coordinator can validate parameters, route clarifications, and preserve
+  deterministic executor grounding. A free-form dialogue plan would be harder
+  to repair and easier to hallucinate.
+
+### Assistant Prompt
+
+The assistant prompt receives compact state:
+
+- transcript so far
+- current step
+- endpoint schema
+- suggested arguments from executor state
+- prior output examples
+- confidence thresholds
+
+It returns an `AssistantTurn` object:
+
+```text
+clarification | tool_calls | final_summary
+```
+
+Tool-call turns must include structured `ToolCallProposal` objects with
+endpoint id, argument dict, and confidence.
+
+Design decision:
+
+- Keep tool-call generation schema-bound and let the executor reject
+  ungrounded arguments.
+
+Reason:
+
+- The assistant can propose, but the executor proves. This keeps LLM fluency
+  separate from trace correctness.
+
+### Judge Prompt
+
+The judge prompt includes the full conversation JSON and a rubric. It tells
+the model to score only visible evidence and return JSON with:
+
+```text
+task_completion
+tool_trace_validity
+argument_grounding
+response_grounding
+naturalness
+overall_score
+confidence
+issues
+rationale
+```
+
+All score fields are validated on a `0..10` range.
+
+### Repair Prompt
+
+The repair prompt receives:
+
+- conversation JSON
+- repair triggers
+- current scores
+- allowed repair strategies
+- output schema for `RepairPlan`
+
+The LLM may propose a plan, but applying the plan still goes through the
+deterministic repair layer.
+
+Design decision:
+
+- LLM repair plans are advisory and schema-constrained.
+
+Reason:
+
+- This demonstrates LLM planning while preventing hosted-model output from
+  directly mutating a trace without validation.
+
+### Failed Prompt Iteration
+
+An earlier registry-enrichment prompt attempted to call Hugging Face-hosted
+models as generic chat models. Two failures followed:
+
+- Gemma was not available through the selected Hugging Face chat route.
+- Qwen returned JSON-shaped suggestions through the router, but the provider
+  hit billing/quota limits before a full enrichment run.
+
+What changed:
+
+- Registry enrichment now uses the same provider-neutral
+  `StructuredLLMClient` as judge and repair.
+- Gemini/Groq/OpenAI-compatible providers can be swapped through `.env`.
+- Hugging Face remains supported as a lower-level adapter, but it is not the
+  only enrichment path.
+- Deterministic enrichment remains the default fallback, so the pipeline is
+  runnable without hosted credentials.
+
+Lesson:
+
+- Prompt quality is not enough if the provider interface is brittle. The
+  project needs provider-neutral structured JSON calls, strict validation, and
+  deterministic fallbacks.
+
+## 17. Context Management
 
 Context is managed at two levels:
 
@@ -2202,7 +2335,7 @@ Implemented tests cover:
 - steering on/off produces different corpora while both runs retain
   comparable counters
 
-## 17. Diversity Experiment
+## 18. Diversity Experiment
 
 The diversity experiment compares two corpus-generation runs:
 
@@ -2366,8 +2499,245 @@ artifacts/diversity/diversity_report.json
 - Optional LLM judging introduces provider variance, so deterministic quality
   metrics remain the primary comparison.
 
-## 18. Open Design Areas
+## 19. Build/Generate Feature Flags
+
+The intended workflow is:
+
+```powershell
+kgmle build
+kgmle generate
+kgmle evaluate
+```
+
+`build` writes the normalized registry and graph artifacts. `generate` now
+loads those artifacts by default when they exist, instead of rebuilding a
+plain graph from raw input. This matters for semantic matching: a graph built
+with semantic expansion keeps its `semantic_related` edges available to the
+sampler during generation.
+
+Global `--use-llm` has consistent behavior across commands:
+
+- `build`: enables provider-neutral structured registry enrichment and
+  semantic graph construction.
+- `generate`: if build artifacts are missing, performs the same LLM registry
+  enrichment and semantic graph construction path; it also allows semantic
+  edges in the sampler.
+- `evaluate`: enables the LLM judge and, when `--repair` is set, the LLM
+  repair planner.
+- `diversity`: enables LLM registry enrichment, semantic graph construction,
+  semantic-edge traversal, and LLM judging.
+
+Semantic traversal remains opt-in without `--use-llm`:
+
+```powershell
+kgmle build --semantic-graph --semantic-backend local
+kgmle generate --allow-semantic-edges
+kgmle diversity --semantic-graph --allow-semantic-edges
+```
+
+Design decision:
+
+- Separate "graph contains semantic edges" from "sampler may traverse semantic
+  edges."
+
+Reason:
+
+- Semantic similarity is useful for candidate discovery, but it is weaker than
+  a grounded output-to-input edge. The sampler therefore still prioritizes
+  grounded edges, then same-domain edges, then semantic edges. This reduces
+  hallucinated chain risk while still allowing semantic hops when they help
+  satisfy diversity or reach a useful cross-domain transition.
+
+Smoke result:
+
+```text
+kgmle build --semantic-graph --semantic-backend local --artifacts-dir artifacts/e2e10_semantic_flow
+kgmle generate --count 10 --seed 42 --artifacts-dir artifacts/e2e10_semantic_flow --allow-semantic-edges
+```
+
+The built graph contained 4 semantic edges. The 10-record generated sample
+used 2 semantic transitions:
+
+```text
+events/book_tickets -> travel/book_itinerary
+travel/book_itinerary -> events/book_tickets
+```
+
+Quality remained unchanged in the offline evaluator:
+
+```text
+records=10
+mean_deterministic_score=10.0
+schema_valid_rate=1.0
+tool_response_coverage=1.0
+repair_attempted=0
+```
+
+Repair is intentionally not part of `generate`. Generation handles inline
+structured-output retries, but validation failures and low judge scores are
+known only after evaluation. The repair loop therefore belongs to:
+
+```powershell
+kgmle evaluate --repair
+kgmle --use-llm evaluate --repair
+```
+
+## 20. Output Schema Validation
+
+The output artifacts are validated with Pydantic schemas in:
+
+```text
+src/kg_mle/schema/
+├── records.py    # generated and scored conversation JSONL records
+├── metrics.py    # evaluation metrics JSON
+└── diversity.py  # diversity experiment report JSON
+```
+
+Design decision:
+
+- Treat Pydantic models as the schema source of truth instead of maintaining a
+  separate JSON Schema file.
+
+Reason:
+
+- The code already uses Pydantic for registry, graph, generator, judge, and
+  repair contracts. Reusing the same validation system avoids schema drift and
+  keeps tests close to the runtime objects reviewers will inspect.
+
+### Conversation Record Schemas
+
+Generated records validate the base conversation protocol:
+
+```text
+conversation_id
+messages
+plan
+metadata
+```
+
+The schema also requires generation metadata needed for downstream analysis:
+
+```text
+metadata.final_chain
+metadata.n_tool_calls
+metadata.tools_visited
+```
+
+Scored records require everything above plus:
+
+```text
+metadata.evaluation
+```
+
+`metadata.evaluation` contains deterministic metrics, quality band,
+usable-for-training flag, and optional LLM judge output.
+
+Design decision:
+
+- Keep the top-level conversation shape strict but allow extra metadata fields.
+
+Reason:
+
+- The top-level JSONL contract should be stable. Metadata is intentionally
+  extensible because sampler steering, repair history, LLM judge details, and
+  future provenance fields evolve faster than the core record shape.
+
+### Metrics Artifact Schema
+
+The evaluation metrics artifact validates:
+
+```text
+summary
+repair_summary
+records
+```
+
+Score fields are constrained to the rubric range `0..10`. Coverage/rate
+fields are constrained to `0..1`. LLM judge results accept either a validated
+judge score object or an error object:
+
+```json
+{"error": "provider quota exceeded"}
+```
+
+Design decision:
+
+- Preserve LLM provider failures as valid artifact data.
+
+Reason:
+
+- Hosted inference is optional and can fail for quota, network, or provider
+  reasons. The pipeline should still produce a usable deterministic evaluation
+  artifact instead of discarding the record.
+
+### Diversity Report Schema
+
+The diversity report schema validates:
+
+```text
+config
+run_a_no_steering
+run_b_steering
+comparison
+artifacts
+```
+
+Each run includes generation stats, diversity metrics, quality metrics, and
+repair summary. Diversity ratios are range-checked, while deltas may be
+negative because steering can improve some metrics and reduce others.
+
+Design decision:
+
+- Validate schema in tests and E2E workflows, not with a separate CLI command.
+
+Reason:
+
+- Generation and evaluation already validate records during normal execution.
+  A separate `kgmle validate` command would add surface area without changing
+  the submitted workflow. Tests provide the stronger guarantee that artifacts
+  stay compatible as the code changes.
+
+## 21. End-To-End Test
+
+The repository includes an offline E2E test:
+
+```text
+tests/e2e/test_pipeline_100.py
+```
+
+It runs:
+
+```text
+kgmle build
+kgmle generate --count 100 --seed 42
+kgmle --use-llm evaluate --max-llm-judge-records 100
+```
+
+The LLM provider is faked at the adapter boundary so the test is deterministic
+and does not require network credentials. This still exercises the same
+LLM-as-judge integration path used by real providers.
+
+Assertions:
+
+- 100 generated records
+- 100 scored records
+- generated and scored JSONL records validate through schema models
+- all 100 records receive judge scores
+- mean judge overall score is at least `8.0`
+- schema valid rate is `1.0`
+- tool response coverage is at least `0.95`
+- at least 50% of records have `>=3` tool calls and `>=2` distinct tools
+- at least one conversation contains assistant clarification before tool use
+
+Threshold rationale:
+
+- `8.0/10` corresponds to "good, minor issue" in the judge rubric. It is high
+  enough to catch broken traces while allowing small naturalness or wording
+  imperfections in synthetic conversations.
+
+## 22. Open Design Areas
 
 Still to implement:
-- Diversity experiment
-- End-to-end test that generates at least 100 samples
+- Real hosted LLM E2E over all 100 records is intentionally not required in
+  CI because provider quota and latency are unstable. Live provider smoke
+  tests remain opt-in.

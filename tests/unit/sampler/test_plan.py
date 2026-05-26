@@ -10,6 +10,7 @@ import pytest
 
 from kg_mle.config import DEFAULT_INPUT_PATH
 from kg_mle.graph import build_tool_graph
+from kg_mle.graph.models import GraphEdge, GraphNode, ToolGraph
 from kg_mle.registry import enrich_registry, load_registry
 from kg_mle.sampler import CorpusPlanner, ToolChainSampler
 
@@ -29,6 +30,45 @@ def test_planner_produces_requested_count(sampler: ToolChainSampler):
     assert len(report.results) + len(report.failures) == 30
     # In the curated fixture, relaxation should be able to satisfy every chain.
     assert len(report.failures) == 0, f"Unexpected failures: {report.failures}"
+
+
+def test_planner_can_allow_semantic_edges():
+    graph = ToolGraph(
+        nodes=[
+            GraphNode(
+                node_id="endpoint:a/one",
+                type="endpoint",
+                label="one",
+                metadata={"endpoint_id": "a/one", "domain": "a"},
+            ),
+            GraphNode(
+                node_id="endpoint:b/two",
+                type="endpoint",
+                label="two",
+                metadata={"endpoint_id": "b/two", "domain": "b"},
+            ),
+        ],
+        edges=[
+            GraphEdge(
+                source="endpoint:a/one",
+                target="endpoint:b/two",
+                type="semantic_related",
+                metadata={"score": 0.91},
+            )
+        ],
+    )
+    planner = CorpusPlanner(
+        ToolChainSampler(graph),
+        steering_enabled=False,
+        seed=42,
+        length_distribution=((2, 1.0),),
+        allow_semantic_edges=True,
+    )
+
+    report = planner.sample_corpus(target_count=1)
+
+    assert report.results[0].transitions[0].advance_type == "semantic"
+    assert report.plan_meta["allow_semantic_edges"] is True
 
 
 def test_planner_targets_multi_step_fraction(sampler: ToolChainSampler):

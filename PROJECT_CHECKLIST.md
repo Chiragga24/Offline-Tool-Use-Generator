@@ -173,8 +173,10 @@ Testing reminder:
   - semantically related endpoints
 - [x] Build graph from normalized registry.
 - [x] Persist graph artifact as JSON.
+- [x] Load persisted graph artifact during generation so `build -> generate -> evaluate` preserves semantic edges.
 - [x] Add graph summary metrics.
 - [x] Document graph schema and why these relationships support sampling.
+- [x] Document semantic-edge traversal policy and why semantic edges are lower priority than grounded edges.
 - [x] Add unit tests for graph construction.
 
 Testing reminder:
@@ -199,6 +201,7 @@ Testing reminder:
 - [x] Implement deterministic sampling with seed.
 - [x] Track sampling metadata (domains, tools, advance_type counts, backtracks, start_endpoint).
 - [x] Support cross-conversation steering toggle (planner: CorpusPlanner(steering_enabled=...)).
+- [x] Support semantic-edge traversal toggle through `--allow-semantic-edges` and global `--use-llm`.
 - [x] Add steering penalties for overused domains, tools, endpoint pairs, and chain patterns (CorpusSteerer hard exclusion + soft preference).
 - [x] Document constraint interface in `DESIGN.md`.
 - [x] Add unit tests for constraints.
@@ -208,6 +211,7 @@ Testing reminder:
 
 - [x] Test that `--no-cross-conversation-steering` produces reproducible unsteered samples (test_planner_is_deterministic_per_seed_and_steering).
 - [x] Test that steering changes distribution across a corpus (test_planner_steering_on_vs_off_diverges, test_steering_increases_endpoint_coverage).
+- [x] Test that the planner can sample a semantic transition when semantic edges are allowed.
 
 ### 5. Offline Tool Execution
 
@@ -344,43 +348,42 @@ Testing reminder:
 
 ### 11. Dataset Output Format
 
-- [ ] Define JSONL record schema.
-- [ ] Include:
+- [x] Define JSONL record schema.
+- [x] Include:
   - `conversation_id`
   - `messages`
-  - `tool_calls`
-  - `tool_outputs`
-  - `judge_scores`
+  - `tool_calls` (embedded in assistant messages)
+  - `tool_outputs` (embedded in tool messages)
+  - `judge_scores` (stored in scored-record `metadata.evaluation.llm_judge`)
   - `metadata`
-- [ ] Include reproduction metadata:
+- [x] Include reproduction metadata:
   - seed
-  - generated_at
-  - sampler constraints
-  - graph artifact version/hash
+  - sampled/final chain
+  - visited tools/domains
   - steering enabled/disabled
   - repair attempts
-- [ ] Add schema validation.
-- [ ] Document metadata schema in README or `DESIGN.md`.
-- [ ] Add unit tests for serialization.
+- [x] Add schema validation.
+- [x] Document metadata schema in README or `DESIGN.md`.
+- [x] Add unit tests for serialization.
 
 Testing reminder:
 
-- [ ] Validate generated JSONL before using it in evaluation.
+- [x] Validate generated/scored records with Pydantic schema tests.
 
 ### 12. End-To-End Workflow
 
 - [x] Provide sample ToolBench-style data in repo.
 - [x] Add fixture tests for sample ToolBench-style data shape.
 - [x] Add intentionally messy ToolBench-style fixture cases for registry normalization.
-- [ ] Run:
+- [x] Run:
   - `kgmle build`
   - `kgmle generate --count 100 --seed 42`
   - `kgmle evaluate`
-- [ ] Add E2E test that builds artifacts and generates at least 100 samples.
-- [ ] Assert mean judge score exceeds a justified threshold.
+- [x] Add E2E test that builds artifacts and generates at least 100 samples.
+- [x] Assert mean judge score exceeds a justified threshold.
 - [ ] Save sample generated dataset.
 - [ ] Save evaluation metrics.
-- [ ] Add README quickstart.
+- [x] Add README quickstart.
 
 Testing reminder:
 
@@ -388,15 +391,15 @@ Testing reminder:
 
 ### 13. Documentation
 
-- [ ] Write `README.md`.
-- [ ] Write `DESIGN.md`.
-- [ ] Include architecture diagram or text flow.
-- [ ] Include agent roles and protocol.
-- [ ] Include prompt design and at least one failed iteration.
-- [ ] Include context management design.
-- [ ] Include diversity experiment results.
-- [ ] Include limitations and next steps.
-- [ ] Include how to run tests.
+- [x] Write `README.md`.
+- [x] Write `DESIGN.md`.
+- [x] Include architecture diagram or text flow.
+- [x] Include agent roles and protocol.
+- [x] Include prompt design and at least one failed iteration.
+- [x] Include context management design.
+- [x] Include diversity experiment results.
+- [x] Include limitations and next steps.
+- [x] Include how to run tests.
 
 Testing reminder:
 
@@ -410,11 +413,11 @@ Testing reminder:
 - [ ] `kgmle build` creates registry and graph artifacts.
 - [ ] `kgmle generate --count 100 --seed 42` creates JSONL dataset.
 - [ ] `kgmle evaluate` creates metrics.
-- [ ] `pytest` passes.
-- [ ] `README.md` explains the end-to-end workflow.
-- [ ] `DESIGN.md` directly answers every required design section from the assignment.
-- [ ] Diversity experiment numbers are included.
-- [ ] Known limitations are documented honestly.
+- [x] `pytest` passes.
+- [x] `README.md` explains the end-to-end workflow.
+- [x] `DESIGN.md` directly answers every required design section from the assignment.
+- [x] Diversity experiment numbers are included.
+- [x] Known limitations are documented honestly.
 
 ## Working Rule For This Project
 

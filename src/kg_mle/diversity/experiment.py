@@ -23,7 +23,15 @@ from kg_mle.generator import (
     DeterministicUser,
     GeneratorConfig,
 )
+from kg_mle.config import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER,
+    DEFAULT_MEM0_LLM_CONFIG,
+    DEFAULT_SEMANTIC_THRESHOLD,
+    DEFAULT_SEMANTIC_TOP_K,
+)
 from kg_mle.graph import build_tool_graph
+from kg_mle.graph.semantic import Mem0SemanticRetriever, SentenceTransformerSemanticRetriever
 from kg_mle.registry import enrich_registry, load_registry
 from kg_mle.sampler import CorpusPlanner, ToolChainSampler
 from kg_mle.utils.paths import ensure_dir
@@ -38,13 +46,27 @@ class DiversityRunConfig:
     repair: bool = False
     judge: LLMJudge | None = None
     max_llm_judge_records: int | None = None
+    semantic_graph: bool = False
+    semantic_backend: str = "local"
+    allow_semantic_edges: bool = False
+    registry_enricher: Any | None = None
+    llm_registry_enrichment: bool = False
 
 
 def run_diversity_experiment(config: DiversityRunConfig) -> dict[str, Any]:
     ensure_dir(config.output_dir)
     registry = load_registry(config.input_path)
-    enrich_registry(registry)
-    graph = build_tool_graph(registry)
+    enrich_registry(
+        registry,
+        enricher=config.registry_enricher,
+        max_llm_endpoints=5 if config.registry_enricher else None,
+    )
+    graph = build_tool_graph(
+        registry,
+        semantic_retriever=_semantic_retriever(config) if config.semantic_graph else None,
+        semantic_threshold=DEFAULT_SEMANTIC_THRESHOLD,
+        semantic_top_k=DEFAULT_SEMANTIC_TOP_K,
+    )
     sampler = ToolChainSampler(graph)
     total_endpoints = registry.endpoint_count()
     total_tools = len(registry.tools)
@@ -59,6 +81,7 @@ def run_diversity_experiment(config: DiversityRunConfig) -> dict[str, Any]:
         count=config.count,
         seed=config.seed,
         steering_enabled=False,
+        allow_semantic_edges=config.allow_semantic_edges,
         output_path=config.output_dir / "run_a_no_steering.jsonl",
     )
     run_b = _generate_run(
@@ -68,6 +91,7 @@ def run_diversity_experiment(config: DiversityRunConfig) -> dict[str, Any]:
         count=config.count,
         seed=config.seed,
         steering_enabled=True,
+        allow_semantic_edges=config.allow_semantic_edges,
         output_path=config.output_dir / "run_b_steering.jsonl",
     )
 
@@ -108,6 +132,10 @@ def run_diversity_experiment(config: DiversityRunConfig) -> dict[str, Any]:
             "repair": config.repair,
             "llm_judge_enabled": config.judge is not None,
             "max_llm_judge_records": config.max_llm_judge_records,
+            "semantic_graph": config.semantic_graph,
+            "semantic_backend": config.semantic_backend,
+            "allow_semantic_edges": config.allow_semantic_edges,
+            "llm_registry_enrichment": config.llm_registry_enrichment,
         },
         "run_a_no_steering": {
             "generation": run_a["generation"],
@@ -144,12 +172,14 @@ def _generate_run(
     count: int,
     seed: int,
     steering_enabled: bool,
+    allow_semantic_edges: bool,
     output_path: Path,
 ) -> dict[str, Any]:
     report = CorpusPlanner(
         sampler,
         steering_enabled=steering_enabled,
         seed=seed,
+        allow_semantic_edges=allow_semantic_edges,
     ).sample_corpus(count)
     executor = OfflineExecutor(registry)
     config = GeneratorConfig()
@@ -182,6 +212,21 @@ def _generate_run(
             "counters_summary": report.counters_summary,
         },
     }
+
+
+def _semantic_retriever(config: DiversityRunConfig):
+    if config.semantic_backend == "local":
+        return SentenceTransformerSemanticRetriever(model_name=DEFAULT_EMBEDDING_MODEL)
+    if config.semantic_backend == "mem0":
+        return Mem0SemanticRetriever(
+            embedding_provider=DEFAULT_EMBEDDING_PROVIDER,
+            embedding_model=DEFAULT_EMBEDDING_MODEL,
+            llm_provider=DEFAULT_MEM0_LLM_CONFIG.provider,
+            llm_model=DEFAULT_MEM0_LLM_CONFIG.model,
+            llm_api_key=DEFAULT_MEM0_LLM_CONFIG.api_key,
+            llm_base_url=DEFAULT_MEM0_LLM_CONFIG.base_url,
+        )
+    raise ValueError("semantic_backend must be one of: local, mem0")
 
 
 def _compare(

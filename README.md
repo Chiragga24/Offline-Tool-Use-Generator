@@ -33,6 +33,19 @@ kgmle --use-llm evaluate --max-llm-judge-records 10
 `--use-llm` is the global switch for optional hosted-model features. The
 older `evaluate --llm-judge` flag remains supported for judge-only runs.
 
+For a full 100-record scored dataset:
+
+```powershell
+kgmle build --semantic-graph --semantic-backend local
+kgmle generate --count 100 --seed 42 --allow-semantic-edges
+kgmle --use-llm evaluate --repair --max-llm-judge-records 10
+```
+
+The raw generated JSONL is useful for debugging. The scored JSONL produced by
+`evaluate` is the training/evaluation-ready dataset because it includes
+`metadata.evaluation` with deterministic metrics, optional LLM judge scores,
+quality band, and repair metadata.
+
 Optional bounded repair pass:
 
 ```powershell
@@ -46,3 +59,13 @@ Diversity experiment:
 kgmle diversity --count 100 --seed 42
 kgmle --use-llm diversity --count 100 --seed 42 --max-llm-judge-records 10
 ```
+
+Tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests -m "not live"
+```
+
+The E2E test builds artifacts, generates 100 conversations, evaluates them
+through the LLM-judge interface with a deterministic fake provider, and asserts
+the mean judge score exceeds the documented threshold.
