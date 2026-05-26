@@ -147,6 +147,100 @@ def test_generate_uses_built_artifacts_and_allows_semantic_edges(tmp_path):
     assert output.exists()
 
 
+def test_global_use_llm_wires_llm_agents_into_generate(tmp_path, monkeypatch):
+    """`--use-llm generate` must actually swap to LLM-backed agents.
+
+    Without this, the global flag steers build (LLM enrichment) and
+    evaluate (LLM judge / repair) but silently no-ops on generate —
+    which would produce deterministic conversations while logging
+    nothing to warn the reviewer.
+    """
+    from kg_mle.generator import (
+        DeterministicAssistant,
+        DeterministicPlanner,
+        DeterministicUser,
+    )
+
+    class _FakeConfig:
+        provider = "gemini"
+        api_key_env = "GOOGLE_API_KEY"
+        api_key = "test-key"
+
+    class _FakeClient:
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+    class _FakeAgentsBuilder:
+        called_with: dict = {}
+
+        def __call__(self, *, client, registry, config):
+            _FakeAgentsBuilder.called_with = {
+                "client": client,
+                "registry": registry,
+                "config": config,
+            }
+            # Return deterministic agents so the conversation still
+            # generates; the test only cares that the LLM-agent code
+            # path was taken.
+            return (
+                DeterministicPlanner(registry, config=config),
+                DeterministicUser(),
+                DeterministicAssistant(),
+            )
+
+    fake_builder = _FakeAgentsBuilder()
+    monkeypatch.setattr("kg_mle.cli.DEFAULT_LLM_CONFIG", _FakeConfig())
+    monkeypatch.setattr("kg_mle.cli.StructuredLLMClient", _FakeClient)
+    monkeypatch.setattr("kg_mle.cli.make_llm_agents", fake_builder)
+    monkeypatch.setattr("kg_mle.cli._semantic_retriever", lambda backend: None)
+
+    output = tmp_path / "conversations.jsonl"
+    result = runner.invoke(
+        app,
+        [
+            "--use-llm",
+            "generate",
+            "--count",
+            "1",
+            "--seed",
+            "7",
+            "--output",
+            str(output),
+            "--no-cross-conversation-steering",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "agents=llm-with-fallback" in result.output
+    assert output.exists()
+    assert len(output.read_text(encoding="utf-8").strip().splitlines()) == 1
+    assert _FakeAgentsBuilder.called_with, (
+        "make_llm_agents was not invoked; --use-llm did not reach generate's coordinator."
+    )
+    assert _FakeAgentsBuilder.called_with["registry"] is not None
+    assert isinstance(_FakeAgentsBuilder.called_with["client"], _FakeClient)
+
+
+def test_generate_without_use_llm_reports_deterministic_agents(tmp_path):
+    output = tmp_path / "conversations.jsonl"
+    result = runner.invoke(
+        app,
+        [
+            "generate",
+            "--count",
+            "1",
+            "--seed",
+            "7",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "agents=deterministic" in result.output
+
+
 def test_evaluate_command_writes_metrics(tmp_path):
     dataset = tmp_path / "conversations.jsonl"
     output = tmp_path / "metrics.json"

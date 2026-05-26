@@ -35,6 +35,7 @@ from kg_mle.generator import (
     DeterministicPlanner,
     DeterministicUser,
     GeneratorConfig,
+    make_llm_agents,
 )
 from kg_mle.graph import build_tool_graph, load_tool_graph, save_tool_graph
 from kg_mle.graph.semantic import Mem0SemanticRetriever, SentenceTransformerSemanticRetriever
@@ -313,13 +314,27 @@ def generate(
     ).sample_corpus(count)
     executor = OfflineExecutor(registry)
     config = GeneratorConfig()
+    agents_mode = "deterministic"
+    planner = DeterministicPlanner(registry, config=config)
+    user_simulator = DeterministicUser()
+    assistant = DeterministicAssistant()
+    if cli_state.use_llm:
+        # LLM agents already wrap deterministic ones as fallback, so an
+        # unreachable provider degrades to deterministic per turn rather
+        # than failing the run. Setup failure (missing creds, import
+        # error) still raises here — at the explicit user request.
+        llm_client = _llm_client_or_error("conversation generation")
+        planner, user_simulator, assistant = make_llm_agents(
+            client=llm_client, registry=registry, config=config
+        )
+        agents_mode = "llm-with-fallback"
     coordinator = ConversationCoordinator(
         registry=registry,
         graph=graph,
         executor=executor,
-        planner=DeterministicPlanner(registry, config=config),
-        user_simulator=DeterministicUser(),
-        assistant=DeterministicAssistant(),
+        planner=planner,
+        user_simulator=user_simulator,
+        assistant=assistant,
         config=config,
     )
     with output.open("w", encoding="utf-8") as handle:
@@ -336,7 +351,8 @@ def generate(
         f"seed={seed} output={output} "
         f"cross_conversation_steering={cross_conversation_steering} "
         f"semantic_edges_in_graph={graph.edge_count('semantic_related')} "
-        f"semantic_edges_allowed={effective_allow_semantic}"
+        f"semantic_edges_allowed={effective_allow_semantic} "
+        f"agents={agents_mode}"
     )
 
 
