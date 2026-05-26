@@ -142,8 +142,8 @@ Important files:
 Current model defaults:
 
 ```text
-KG_MLE_LLM_PROVIDER=huggingface
-KG_MLE_LLM_MODEL=google/gemma-4-E2B-it
+KG_MLE_LLM_PROVIDER=gemini
+KG_MLE_LLM_MODEL=gemini-2.0-flash-lite-001
 KG_MLE_SEMANTIC_BACKEND=local
 KG_MLE_EMBEDDING_PROVIDER=huggingface
 KG_MLE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
@@ -164,6 +164,44 @@ Alternative considered:
 Reason rejected:
 
 - Reviewer environments may not have credentials. The required workflow should still run offline.
+
+### Hosted LLM Provider Choice
+
+The default hosted LLM provider is Gemini, with Groq as the preferred
+backup for open-model inference.
+
+Design decision:
+
+- Use Gemini for optional generation and judge calls.
+- Keep Groq behind the same structured JSON client as an OpenAI-compatible
+  backup.
+- Keep Hugging Face as an optional adapter, not the default path.
+
+Reason:
+
+- Gemini has a practical free-tier path for API testing and supports
+  JSON-shaped generation well enough for structured-output prompts.
+- Groq gives a second hosted path for open models without downloading
+  weights locally.
+- Hugging Face Inference Providers are useful, but the Qwen live test hit
+  provider billing limits, so HF is too volatile to be the default reviewer
+  path.
+
+Implementation:
+
+```text
+src/kg_mle/llm/clients.py
+```
+
+`StructuredLLMClient` supports:
+
+- Gemini REST `generateContent` with `responseMimeType=application/json`
+- Groq `/openai/v1/chat/completions` with `response_format=json_object`
+- other OpenAI-compatible providers through `KG_MLE_LLM_BASE_URL`
+- Hugging Face as a retained fallback adapter
+
+The generator agents depend only on `complete_json(...)`, so switching
+providers does not change planner/user/assistant logic.
 
 ## 6. Tool Registry
 
@@ -1489,11 +1527,30 @@ The coordinator never crashes on LLM behaviour. The worst case is a
 deterministic conversation with metadata noting why the LLM path
 was abandoned.
 
+---
+
+**Design decision:** Provider-neutral structured JSON client for LLM agents.
+
+**Alternative considered:** Keep `llm_agents.py` directly tied to the
+Hugging Face `InferenceClient`.
+
+**Reason rejected:** The Qwen path through Hugging Face reached a live
+provider but hit billing/credit limits. That made the assignment's
+LLM path depend on a provider-specific payment wall rather than on the
+project's own design. The generator now uses `kg_mle.llm.StructuredLLMClient`,
+which supports Gemini as the default hosted path and Groq as a backup,
+while preserving HF as an optional adapter.
+
+The provider adapter returns raw JSON text only. Pydantic validation,
+retry-with-error-context, confidence gates, and deterministic fallback
+remain in the agent layer. This keeps provider plumbing separate from
+generation policy.
+
 ### Live Integration Tests
 
 `tests/integration/test_llm_generator_live.py` runs the full
-LLM-driven pipeline against the configured HF provider when `HF_TOKEN`
-is present:
+LLM-driven pipeline against the configured Gemini, Groq, or Hugging Face
+provider when the matching API key is present:
 
 - `test_llm_generator_live_produces_structurally_valid_conversation`
   — 2-step chain end-to-end, asserts role tags, ≥1 successful tool
@@ -1509,10 +1566,209 @@ Both skip without credentials. Both treat provider exceptions as
 "skip, not fail" — provider availability is volatile and CI's job is
 catching protocol regressions.
 
-## 14. Open Design Areas
+## 14. Evaluation And LLM-As-Judge
+
+The evaluator has two layers:
+
+```text
+deterministic structural metrics
+-> optional hosted LLM judge
+-> JSON metrics artifact
+```
+
+Command:
+
+```powershell
+kgmle evaluate --input data/outputs/conversations.jsonl --output data/outputs/evaluation_metrics.json
+kgmle evaluate --llm-judge --max-llm-judge-records 10
+```
+
+The command writes two outputs:
+
+```text
+evaluation_metrics.json       aggregate + per-record metrics
+evaluation_metrics_scored.jsonl
+                              original conversations with metadata.evaluation populated
+```
+
+Deterministic metrics are always available and do not require credentials:
+
+- schema validity through the `Conversation` Pydantic model
+- role sequence validity
+- assistant tool-call to tool-response coverage
+- chain completion against expected `metadata.n_tool_calls`
+- tool error rate
+- aggregate deterministic score
+
+Score ranges:
+
+- rubric scores use a 0-10 scale
+- `deterministic_score` and `mean_deterministic_score` use a 0-10 scale
+- LLM judge dimensions and `mean_llm_overall_score` use a 0-10 scale
+- coverage/rate fields such as `chain_completion`, `tool_response_coverage`,
+  and `schema_valid_rate` remain 0-1 ratios because they are fractions, not
+  rubric scores
+
+The optional LLM judge uses the same provider-neutral
+`StructuredLLMClient` as the generator. The default hosted path is Gemini;
+Groq can be used by switching `KG_MLE_LLM_PROVIDER=groq`.
+
+### Evaluation Design Principles
+
+The evaluator follows these design principles:
+
+- **Offline-first:** deterministic metrics run without credentials, network,
+  or a hosted model.
+- **Human-readable scale:** rubric scores are 0-10 because reviewers and
+  hiring panels can interpret them faster than 0-1 decimals.
+- **Separation of scores and rates:** quality scores are 0-10, while
+  mathematical coverage ratios remain 0-1.
+- **Structured judge output:** the LLM must return a Pydantic-validated JSON
+  object, not free-form prose.
+- **Visible-evidence judging:** the LLM judge is instructed to score only the
+  supplied conversation JSON and not infer real API behavior.
+- **Failure containment:** provider failures are stored in the record's
+  `llm_judge.error` field instead of crashing evaluation.
+- **Bounded cost:** `--max-llm-judge-records` limits how many records are sent
+  to the hosted judge.
+- **Provider portability:** the judge uses the same `StructuredLLMClient` as
+  generation, so Gemini, Groq, and OpenAI-compatible providers can be swapped
+  through `.env`.
+
+### Evaluation Design Decisions
+
+**Design decision:** Two-layer evaluation: deterministic metrics first,
+optional LLM-as-judge second.
+
+**Reason:** Deterministic metrics guarantee that every reviewer can run
+evaluation offline. The LLM judge adds qualitative signal when credentials
+are available, but it is not required for the pipeline to function.
+
+---
+
+**Design decision:** Use dimensions tied to tool-use training quality rather
+than generic chatbot quality.
+
+**Reason:** Training data for tool-use agents must reward correct action
+traces, grounded arguments, and faithful final responses. Generic dimensions
+such as "helpfulness" or "fluency" would miss invalid tool calls that still
+sound natural.
+
+---
+
+**Design decision:** Separate `argument_grounding` from
+`response_grounding`.
+
+**Reason:** These are different failure modes. A model can pass an invented
+ID into a tool even if the final answer sounds grounded, or it can call tools
+correctly and then hallucinate the final response. Keeping them separate
+makes filtering and repair more targeted.
+
+---
+
+**Design decision:** Use a 0-10 scale for quality scores while leaving
+coverage metrics as 0-1 ratios.
+
+**Reason:** 0-10 is easier for humans to read in review artifacts. Coverage
+metrics such as `chain_completion` are mathematical fractions, so converting
+them to 0-10 would make them less precise and less conventional.
+
+---
+
+**Design decision:** Store scores in both evaluation artifacts and scored
+conversation metadata.
+
+**Reason:** Aggregate metrics are useful for comparing runs, but downstream
+training/filtering needs per-conversation scores colocated with the
+conversation record. The raw generated JSONL is preserved; `kgmle evaluate`
+writes a separate scored JSONL.
+
+---
+
+**Design decision:** Treat hosted-provider failures as record-level judge
+errors, not pipeline failures.
+
+**Reason:** Gemini/Groq/HF quotas and availability are external to the
+project. A provider error should not invalidate deterministic evaluation or
+block the review workflow.
+
+### Judge Dimensions
+
+The judge dimensions are chosen specifically for training tool-use agents:
+
+- `task_completion` (0-10): measures whether the final assistant response
+  actually satisfies the user's request. This is the main supervised signal
+  for whether the trajectory is worth training on.
+- `tool_trace_validity` (0-10): measures whether the assistant selected valid
+  tools, called them in a coherent order, and received compatible tool
+  responses. Tool-use agents need valid action traces, not just good final
+  prose.
+- `argument_grounding` (0-10): measures whether tool-call arguments come from
+  user input, planned values, or prior tool outputs. This catches fabricated
+  IDs and unsupported chained arguments, which are among the most harmful
+  errors for tool-learning data.
+- `response_grounding` (0-10): measures whether the assistant's final answer
+  stays faithful to the tool outputs. This prevents training examples where
+  the model calls tools correctly but then hallucinates the answer.
+- `naturalness` (0-10): measures whether the dialogue reads like a plausible
+  user-assistant interaction. This matters because the dataset is intended
+  for conversational agents, not only API-call planners.
+- `overall_score` (0-10): holistic score used for filtering and comparing
+  runs. It is not required to be a simple average; severe tool or grounding
+  failures can dominate.
+- `confidence` (0-10): judge confidence in its own score, used to identify
+  records that may need deterministic review or re-judging.
+
+The dimensions intentionally separate *trace correctness* from *answer
+quality*. A conversation can have natural wording but a bad tool trace, or
+a valid tool trace but an ungrounded final answer; both cases should be
+visible to the filtering logic.
+
+Design decision:
+
+- Make deterministic evaluation the default.
+- Make LLM-as-judge opt-in through `--llm-judge`.
+- Validate judge output with Pydantic before it is accepted.
+
+Reason:
+
+- Reviewers can run evaluation offline.
+- LLM judging demonstrates rubric-style qualitative assessment without
+  making the project fail when hosted inference is unavailable.
+- Structured judge output keeps scores machine-readable and prevents
+  free-text-only evaluation from becoming hard to aggregate.
+
+Judge schema:
+
+```text
+task_completion     0-10
+tool_trace_validity 0-10
+argument_grounding  0-10
+response_grounding  0-10
+naturalness         0-10
+overall_score       0-10
+confidence          0-10
+issues
+rationale
+```
+
+The judge prompt explicitly tells the model to score only visible JSON,
+penalize missing role tags, missing tool responses, invented tool IDs,
+unresolved tool errors, and ungrounded arguments.
+
+Each scored conversation stores the evaluation under:
+
+```text
+metadata.evaluation
+```
+
+This includes deterministic metrics, the 0-10 deterministic score, and the
+optional LLM judge result or provider error. The original generated input
+JSONL is not overwritten; `kgmle evaluate` writes a separate scored JSONL so
+reviewers can compare raw vs evaluated artifacts.
+
+## 15. Open Design Areas
 
 Still to implement:
-- Deterministic evaluator plus optional Gemma-backed judge
-- Retry/repair loop
 - Diversity experiment
 - End-to-end test that generates at least 100 samples

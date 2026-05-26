@@ -52,7 +52,7 @@ def load_llm_provider_config(
     model_env: str = "KG_MLE_LLM_MODEL",
     base_url_env: str = "KG_MLE_LLM_BASE_URL",
 ) -> LLMProviderConfig:
-    provider = os.getenv(provider_env, "huggingface").strip().lower()
+    provider = os.getenv(provider_env, "gemini").strip().lower()
     model = os.getenv(model_env, DEFAULT_PROVIDER_MODELS.get(provider, "local-model"))
     api_key_env = PROVIDER_API_KEY_ENV.get(provider)
     base_url = os.getenv(base_url_env)

@@ -251,24 +251,27 @@ Testing reminder:
 
 ### 7. LLM-As-Judge And Evaluation
 
-- [ ] Define quality dimensions, likely:
+- [x] Define quality dimensions:
   - tool correctness
   - grounding/coherence
   - task completion
   - naturalness
-- [ ] Implement evaluator interface.
-- [ ] Implement deterministic/local judge fallback for offline testability.
-- [ ] Optionally support real LLM judge through environment configuration.
-- [ ] Store judge scores in each conversation record.
-- [ ] Implement `kgmle evaluate` summary metrics.
-- [ ] Document judge dimensions and thresholds in `DESIGN.md`.
-- [ ] Add unit tests for judge output parsing.
-- [ ] Add unit tests for scoring edge cases.
+- [x] Implement evaluator interface.
+- [x] Implement deterministic/local judge fallback for offline testability.
+- [x] Optionally support real LLM judge through environment configuration.
+- [x] Store judge scores in each evaluation record.
+- [x] Store judge scores in each scored conversation's `metadata.evaluation`.
+- [x] Implement `kgmle evaluate` summary metrics.
+- [x] Use a 0-10 scale for rubric scores and deterministic score.
+- [x] Keep coverage/rate metrics as 0-1 fractions.
+- [x] Document judge dimensions, score ranges, and design principles in `DESIGN.md`.
+- [x] Add unit tests for judge output parsing.
+- [x] Add unit tests for scoring edge cases.
 
 Testing reminder:
 
-- [ ] Tests should not require network or real LLM credentials.
-- [ ] Real LLM support, if added, should be optional.
+- [x] Tests should not require network or real LLM credentials.
+- [x] Real LLM support is optional and gated by `--llm-judge`.
 
 ### 8. Retry And Repair
 

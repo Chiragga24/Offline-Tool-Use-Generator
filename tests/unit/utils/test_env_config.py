@@ -4,7 +4,7 @@ from kg_mle import config
 
 
 def test_env_defaults_are_present_without_required_secret_values():
-    assert config.DEFAULT_LLM_PROVIDER == "huggingface"
+    assert config.DEFAULT_LLM_PROVIDER
     assert config.DEFAULT_LLM_MODEL
     assert config.DEFAULT_EMBEDDING_PROVIDER == "huggingface"
     assert config.DEFAULT_EMBEDDING_MODEL == "sentence-transformers/all-MiniLM-L6-v2"

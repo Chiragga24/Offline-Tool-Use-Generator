@@ -1,6 +1,17 @@
 from kg_mle.llm.providers import load_llm_provider_config, load_mem0_llm_provider_config
 
 
+def test_load_llm_provider_config_defaults_to_gemini(monkeypatch):
+    monkeypatch.delenv("KG_MLE_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("KG_MLE_LLM_MODEL", raising=False)
+
+    config = load_llm_provider_config()
+
+    assert config.provider == "gemini"
+    assert config.model == "gemini-2.0-flash-lite-001"
+    assert config.api_key_env == "GOOGLE_API_KEY"
+
+
 def test_load_llm_provider_config_infers_api_key_env(monkeypatch):
     monkeypatch.setenv("KG_MLE_LLM_PROVIDER", "gemini")
     monkeypatch.setenv("KG_MLE_LLM_MODEL", "gemini-2.0-flash-lite-001")

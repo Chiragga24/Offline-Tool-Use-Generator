@@ -1,6 +1,6 @@
 """Live integration test for the LLM-backed conversation generator.
 
-Same shape as the other live tests: runs when HF_TOKEN is present,
+Same shape as the other live tests: runs when a configured LLM key is present,
 skips otherwise; skips (does not fail) on any provider-side error.
 Catches *protocol regressions* without flaking on LLM variance:
 
@@ -41,14 +41,17 @@ from kg_mle.sampler import ChainConstraints, ToolChainSampler
 pytestmark = pytest.mark.live
 
 
-def _require_hf_token() -> None:
-    if DEFAULT_LLM_CONFIG.provider != "huggingface":
+def _require_live_llm_config() -> None:
+    if DEFAULT_LLM_CONFIG.provider not in {"gemini", "groq", "huggingface"}:
         pytest.skip(
-            "LLM generator live test requires KG_MLE_LLM_PROVIDER=huggingface "
+            "LLM generator live test currently supports gemini, groq, or huggingface "
             f"(currently {DEFAULT_LLM_CONFIG.provider!r})."
         )
     if not DEFAULT_LLM_CONFIG.api_key:
-        pytest.skip("LLM generator live test requires HF_TOKEN.")
+        pytest.skip(
+            "LLM generator live test requires the configured provider API key "
+            f"({DEFAULT_LLM_CONFIG.api_key_env})."
+        )
 
 
 def _build_pipeline():
@@ -71,16 +74,12 @@ def test_llm_generator_live_produces_structurally_valid_conversation():
       - the chain length matches the original chain or a graph-verified
         deviation.
     """
-    _require_hf_token()
+    _require_live_llm_config()
 
     registry, graph, sampler, executor = _build_pipeline()
 
     try:
-        client = StructuredLLMClient(
-            model=DEFAULT_LLM_CONFIG.model,
-            api_key=DEFAULT_LLM_CONFIG.api_key,
-            provider=DEFAULT_LLM_CONFIG.extra.get("hf_provider"),
-        )
+        client = StructuredLLMClient.from_config(DEFAULT_LLM_CONFIG)
     except RuntimeError as exc:
         pytest.skip(f"LLM client setup unavailable: {exc}")
 
@@ -156,15 +155,11 @@ def test_llm_generator_live_runs_multi_step_chain_to_completion():
     coordinator tests already prove the coordinator drives a 3-step chain
     to completion when agents cooperate.
     """
-    _require_hf_token()
+    _require_live_llm_config()
     registry, graph, sampler, executor = _build_pipeline()
 
     try:
-        client = StructuredLLMClient(
-            model=DEFAULT_LLM_CONFIG.model,
-            api_key=DEFAULT_LLM_CONFIG.api_key,
-            provider=DEFAULT_LLM_CONFIG.extra.get("hf_provider"),
-        )
+        client = StructuredLLMClient.from_config(DEFAULT_LLM_CONFIG)
     except RuntimeError as exc:
         pytest.skip(f"LLM client setup unavailable: {exc}")
 

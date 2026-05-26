@@ -20,9 +20,26 @@ from kg_mle.config import (
     DEFAULT_SEMANTIC_THRESHOLD,
     DEFAULT_SEMANTIC_TOP_K,
 )
+from kg_mle.evaluation import (
+    LLMJudge,
+    evaluate_dataset,
+    load_conversations_jsonl,
+    save_evaluation,
+    save_scored_conversations,
+)
+from kg_mle.executor import OfflineExecutor
+from kg_mle.generator import (
+    ConversationCoordinator,
+    DeterministicAssistant,
+    DeterministicPlanner,
+    DeterministicUser,
+    GeneratorConfig,
+)
 from kg_mle.graph import build_tool_graph, save_tool_graph
 from kg_mle.graph.semantic import Mem0SemanticRetriever, SentenceTransformerSemanticRetriever
+from kg_mle.llm import StructuredLLMClient
 from kg_mle.registry import HuggingFaceRegistryEnricher, enrich_registry, load_registry, save_registry
+from kg_mle.sampler import CorpusPlanner, ToolChainSampler
 from kg_mle.utils.logging import configure_logging, get_logger
 from kg_mle.utils.paths import ensure_dir, ensure_parent_dir
 
@@ -197,9 +214,38 @@ def generate(
     """Generate synthetic tool-use conversations."""
     ensure_parent_dir(output)
     logger.info("Generate command starting")
+    registry = load_registry(DEFAULT_INPUT_PATH)
+    enrich_registry(registry)
+    graph = build_tool_graph(registry)
+    sampler = ToolChainSampler(graph)
+    report = CorpusPlanner(
+        sampler,
+        steering_enabled=cross_conversation_steering,
+        seed=seed,
+    ).sample_corpus(count)
+    executor = OfflineExecutor(registry)
+    config = GeneratorConfig()
+    coordinator = ConversationCoordinator(
+        registry=registry,
+        graph=graph,
+        executor=executor,
+        planner=DeterministicPlanner(registry, config=config),
+        user_simulator=DeterministicUser(),
+        assistant=DeterministicAssistant(),
+        config=config,
+    )
+    with output.open("w", encoding="utf-8") as handle:
+        for idx, chain in enumerate(report.results):
+            conversation = coordinator.run(
+                chain,
+                seed=chain.seed,
+                conversation_id=f"conv_{seed}_{idx:05d}",
+            )
+            handle.write(conversation.model_dump_json() + "\n")
     console.print(
-        "[yellow]generate is scaffolded[/yellow]: "
-        f"count={count} seed={seed} output={output} "
+        "[green]generated dataset[/green]: "
+        f"requested={count} records={len(report.results)} failures={len(report.failures)} "
+        f"seed={seed} output={output} "
         f"cross_conversation_steering={cross_conversation_steering}"
     )
 
@@ -208,14 +254,60 @@ def generate(
 def evaluate(
     input_path: Annotated[
         Path,
-        typer.Option("--input", "-i", help="Generated dataset JSONL path."),
+        typer.Option("--input", "-i", exists=True, file_okay=True, readable=True, help="Generated dataset JSONL path."),
     ] = DEFAULT_DATASET_PATH,
     output: Annotated[
         Path,
         typer.Option("--output", "-o", help="Evaluation metrics JSON path."),
     ] = DEFAULT_EVALUATION_PATH,
+    llm_judge: Annotated[
+        bool,
+        typer.Option(
+            "--llm-judge/--no-llm-judge",
+            help="Use the configured hosted LLM as an optional judge.",
+        ),
+    ] = False,
+    max_llm_judge_records: Annotated[
+        int,
+        typer.Option(
+            "--max-llm-judge-records",
+            min=1,
+            help="Maximum records to send to the live LLM judge.",
+        ),
+    ] = 10,
+    scored_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--scored-output",
+            help="Optional JSONL path for conversations with metadata.evaluation populated.",
+        ),
+    ] = None,
 ) -> None:
     """Validate generated conversations and compute evaluation metrics."""
     ensure_parent_dir(output)
     logger.info("Evaluate command starting")
-    console.print(f"[yellow]evaluate is scaffolded[/yellow]: input={input_path} output={output}")
+    conversations = load_conversations_jsonl(input_path)
+    judge = None
+    if llm_judge:
+        if not DEFAULT_LLM_CONFIG.api_key and DEFAULT_LLM_CONFIG.provider not in {"lmstudio", "vllm"}:
+            raise typer.BadParameter(
+                f"--llm-judge requires {DEFAULT_LLM_CONFIG.api_key_env} "
+                f"for provider {DEFAULT_LLM_CONFIG.provider!r}."
+            )
+        judge = LLMJudge(StructuredLLMClient.from_config(DEFAULT_LLM_CONFIG))
+    evaluation = evaluate_dataset(
+        conversations,
+        judge=judge,
+        max_judged_records=max_llm_judge_records if judge else None,
+    )
+    save_evaluation(evaluation, output)
+    scored_output_path = scored_output or output.with_name(f"{output.stem}_scored.jsonl")
+    save_scored_conversations(evaluation, scored_output_path)
+    summary = evaluation["summary"]
+    console.print(
+        "[green]evaluated dataset[/green]: "
+        f"records={summary['conversation_count']} "
+        f"mean_score={summary['mean_deterministic_score']} "
+        f"llm_judged={summary['llm_judged_count']} "
+        f"output={output} scored_output={scored_output_path}"
+    )

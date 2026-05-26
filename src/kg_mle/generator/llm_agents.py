@@ -20,10 +20,10 @@ can read the metadata to know which conversations were LLM-driven.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from pydantic import ValidationError
+import json
 
 from kg_mle.executor.session import ExecutorSession
 from kg_mle.generator.agents import (
@@ -41,61 +41,9 @@ from kg_mle.generator.protocol import (
     Plan,
     UserTurn,
 )
+from kg_mle.llm.clients import StructuredLLMClient
 from kg_mle.registry.models import ToolRegistry
 from kg_mle.sampler.constraints import SamplingResult
-
-
-class StructuredLLMClient:
-    """Provider-portable structured-JSON LLM client.
-
-    Tries chat_completion with `response_format={"type": "json_object"}`
-    first; falls back to text_generation if the provider doesn't
-    support JSON mode (the HF Inference API behaviour for many
-    instruction models).
-    """
-
-    def __init__(
-        self,
-        *,
-        model: str,
-        api_key: str | None,
-        provider: str | None = None,
-    ) -> None:
-        try:
-            from huggingface_hub import InferenceClient
-        except ImportError as exc:
-            raise RuntimeError(
-                "LLM agents require huggingface-hub (already a project dependency)."
-            ) from exc
-        self._client = InferenceClient(model=model, token=api_key, provider=provider)
-        self.model = model
-
-    def complete_json(self, *, system: str, user: str, temperature: float = 0.4) -> str:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        if hasattr(self._client, "chat_completion"):
-            try:
-                response = self._client.chat_completion(
-                    messages=messages,
-                    max_tokens=1500,
-                    temperature=temperature,
-                    top_p=1.0,
-                    response_format={"type": "json_object"},
-                )
-                content = response.choices[0].message.content or ""
-                if content:
-                    return content
-            except Exception:
-                pass
-        response = self._client.text_generation(
-            f"{system}\n\n{user}\n\nReturn only JSON.",
-            max_new_tokens=1500,
-            temperature=temperature,
-            return_full_text=False,
-        )
-        return str(response)
 
 
 def _extract_json_object(content: str) -> dict[str, Any]:
