@@ -495,20 +495,19 @@ def diversity(
     """Compare generation with steering disabled vs enabled."""
     logger.info("Diversity command starting")
     judge = None
+    generator_client = None
+    registry_enricher = None
     if cli_state.use_llm:
-        if not DEFAULT_LLM_CONFIG.api_key and DEFAULT_LLM_CONFIG.provider not in {"lmstudio", "vllm"}:
-            raise typer.BadParameter(
-                f"LLM features require {DEFAULT_LLM_CONFIG.api_key_env} "
-                f"for provider {DEFAULT_LLM_CONFIG.provider!r}."
-            )
-        judge = LLMJudge(_llm_client_or_error("judge"))
+        # One client serves all three LLM features for the experiment:
+        # registry enrichment, generator agents, and the judge. Generator
+        # agents wrap deterministic fallbacks per turn, so a provider
+        # outage degrades gracefully rather than aborting either run.
+        llm_client = _llm_client_or_error("diversity LLM features")
+        judge = LLMJudge(llm_client)
+        generator_client = llm_client
+        registry_enricher = StructuredLLMRegistryEnricher(client=llm_client)
     effective_semantic_graph = semantic_graph or cli_state.use_llm
     effective_allow_semantic = allow_semantic_edges or cli_state.use_llm
-    registry_enricher = (
-        StructuredLLMRegistryEnricher(client=_llm_client_or_error("registry enrichment"))
-        if cli_state.use_llm
-        else None
-    )
     report = run_diversity_experiment(
         DiversityRunConfig(
             count=count,
@@ -523,6 +522,7 @@ def diversity(
             allow_semantic_edges=effective_allow_semantic,
             registry_enricher=registry_enricher,
             llm_registry_enrichment=registry_enricher is not None,
+            generator_client=generator_client,
         )
     )
     comparison = report["comparison"]
@@ -533,6 +533,7 @@ def diversity(
         f"domain_entropy_delta={comparison['domain_entropy_delta']} "
         f"semantic_graph={effective_semantic_graph} "
         f"semantic_edges_allowed={effective_allow_semantic} "
+        f"llm_generation={generator_client is not None} "
         f"llm_registry_enrichment={registry_enricher is not None} "
         f"report={output_dir / 'diversity_report.json'}"
     )

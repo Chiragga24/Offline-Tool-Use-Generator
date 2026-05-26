@@ -608,5 +608,113 @@ def test_diversity_use_llm_wires_provider_neutral_judge(tmp_path, monkeypatch):
     assert report["config"]["semantic_graph"] is True
     assert report["config"]["allow_semantic_edges"] is True
     assert report["config"]["llm_registry_enrichment"] is True
+    assert report["config"]["llm_generation_enabled"] is True
+    assert report["run_a_no_steering"]["generation"]["llm_generation"] is True
+    assert report["run_b_steering"]["generation"]["llm_generation"] is True
     assert report["run_a_no_steering"]["quality"]["llm_judged_count"] == 1
     assert report["run_b_steering"]["quality"]["llm_judged_count"] == 1
+
+
+def test_diversity_use_llm_invokes_llm_generator_agents(tmp_path, monkeypatch):
+    """--use-llm diversity must route both runs through LLM generator agents
+    (with deterministic fallback), not silently stay deterministic."""
+    from kg_mle.generator import (
+        DeterministicAssistant,
+        DeterministicPlanner,
+        DeterministicUser,
+    )
+
+    output_dir = tmp_path / "diversity_llm_gen"
+
+    class _FakeConfig:
+        provider = "gemini"
+        api_key_env = "GOOGLE_API_KEY"
+        api_key = "test-key"
+
+    class _FakeClient:
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+    class _FakeJudge:
+        def __init__(self, client):
+            pass
+
+        def score(self, conversation):
+            class _Score:
+                def model_dump(self):
+                    return {
+                        "task_completion": 9.0,
+                        "tool_trace_validity": 9.0,
+                        "argument_grounding": 9.0,
+                        "response_grounding": 9.0,
+                        "naturalness": 9.0,
+                        "overall_score": 9.0,
+                        "confidence": 9.0,
+                        "issues": [],
+                        "rationale": "fake",
+                    }
+
+            return _Score()
+
+    class _FakeEnricher:
+        def __init__(self, client):
+            pass
+
+        def suggest(self, endpoint):
+            return []
+
+    builder_calls = {"count": 0, "clients": []}
+
+    def fake_make_llm_agents(*, client, registry, config):
+        builder_calls["count"] += 1
+        builder_calls["clients"].append(client)
+        return (
+            DeterministicPlanner(registry, config=config),
+            DeterministicUser(),
+            DeterministicAssistant(),
+        )
+
+    monkeypatch.setattr("kg_mle.cli.DEFAULT_LLM_CONFIG", _FakeConfig())
+    monkeypatch.setattr("kg_mle.cli.StructuredLLMClient", _FakeClient)
+    monkeypatch.setattr("kg_mle.cli.LLMJudge", _FakeJudge)
+    monkeypatch.setattr("kg_mle.cli.StructuredLLMRegistryEnricher", _FakeEnricher)
+    monkeypatch.setattr("kg_mle.diversity.experiment._semantic_retriever", lambda config: None)
+    monkeypatch.setattr("kg_mle.diversity.experiment.make_llm_agents", fake_make_llm_agents)
+
+    result = runner.invoke(
+        app,
+        [
+            "--use-llm",
+            "diversity",
+            "--count",
+            "2",
+            "--seed",
+            "5",
+            "--output-dir",
+            str(output_dir),
+            "--max-llm-judge-records",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "llm_generation=True" in result.output
+    # make_llm_agents is built once per run (Run A and Run B) = 2 invocations.
+    assert builder_calls["count"] == 2
+    # Both runs received the same single client the CLI constructed.
+    assert isinstance(builder_calls["clients"][0], _FakeClient)
+
+
+def test_diversity_default_keeps_deterministic_generation(tmp_path):
+    """Without --use-llm, both runs report llm_generation=False."""
+    output_dir = tmp_path / "diversity_det"
+    result = runner.invoke(
+        app,
+        ["diversity", "--count", "2", "--seed", "5", "--output-dir", str(output_dir)],
+    )
+    assert result.exit_code == 0
+    report = json.loads((output_dir / "diversity_report.json").read_text(encoding="utf-8"))
+    assert report["config"]["llm_generation_enabled"] is False
+    assert report["run_a_no_steering"]["generation"]["llm_generation"] is False
+    assert report["run_b_steering"]["generation"]["llm_generation"] is False

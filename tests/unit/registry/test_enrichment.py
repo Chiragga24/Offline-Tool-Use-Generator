@@ -130,3 +130,27 @@ def test_unresolved_fields_returns_noncanonical_fields():
     unresolved = unresolved_fields(endpoint)
 
     assert ("response_field", "change_pct") in unresolved
+
+
+def test_enrich_registry_contains_enricher_provider_errors():
+    """A provider quota/outage error in the enricher must not abort the
+    pipeline. Deterministic enrichment still applies; the failure is
+    recorded in report.errors and the LLM pass stops."""
+
+    class _ExplodingEnricher:
+        def suggest(self, endpoint):
+            raise RuntimeError("Provider HTTP 429: quota exceeded")
+
+    registry = load_registry(DEFAULT_INPUT_PATH)
+    report = enrich_registry(registry, enricher=_ExplodingEnricher(), max_llm_endpoints=5)
+
+    # Did not raise; deterministic aliases still applied (destination -> city).
+    deal_endpoint = next(
+        e for e in registry.endpoints if e.endpoint_id == "travel/search_travel_deals"
+    )
+    destination = next(p for p in deal_endpoint.parameters if p.name == "destination")
+    assert destination.canonical_name == "city"
+    # Error recorded, LLM pass stopped after the first failure.
+    assert len(report.errors) == 1
+    assert "429" in report.errors[0]
+    assert not [item for item in report.accepted if item.source == "llm"]

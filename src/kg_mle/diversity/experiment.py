@@ -22,6 +22,7 @@ from kg_mle.generator import (
     DeterministicPlanner,
     DeterministicUser,
     GeneratorConfig,
+    make_llm_agents,
 )
 from kg_mle.config import (
     DEFAULT_EMBEDDING_MODEL,
@@ -51,6 +52,13 @@ class DiversityRunConfig:
     allow_semantic_edges: bool = False
     registry_enricher: Any | None = None
     llm_registry_enrichment: bool = False
+    generator_client: Any | None = None
+    """Optional StructuredLLMClient. When set, both runs use LLM generator
+    agents (with deterministic fallback per turn). When None, both runs use
+    deterministic agents — the reproducible default. Diversity metrics are
+    chain-based (from the sampler), so they primarily reflect steering either
+    way; LLM generation mainly changes the quality metrics and any
+    LLM-accepted chain deviations."""
 
 
 def run_diversity_experiment(config: DiversityRunConfig) -> dict[str, Any]:
@@ -83,6 +91,7 @@ def run_diversity_experiment(config: DiversityRunConfig) -> dict[str, Any]:
         steering_enabled=False,
         allow_semantic_edges=config.allow_semantic_edges,
         output_path=config.output_dir / "run_a_no_steering.jsonl",
+        llm_client=config.generator_client,
     )
     run_b = _generate_run(
         registry=registry,
@@ -93,6 +102,7 @@ def run_diversity_experiment(config: DiversityRunConfig) -> dict[str, Any]:
         steering_enabled=True,
         allow_semantic_edges=config.allow_semantic_edges,
         output_path=config.output_dir / "run_b_steering.jsonl",
+        llm_client=config.generator_client,
     )
 
     eval_a = evaluate_dataset(
@@ -131,6 +141,7 @@ def run_diversity_experiment(config: DiversityRunConfig) -> dict[str, Any]:
             "input_path": str(config.input_path),
             "repair": config.repair,
             "llm_judge_enabled": config.judge is not None,
+            "llm_generation_enabled": config.generator_client is not None,
             "max_llm_judge_records": config.max_llm_judge_records,
             "semantic_graph": config.semantic_graph,
             "semantic_backend": config.semantic_backend,
@@ -174,6 +185,7 @@ def _generate_run(
     steering_enabled: bool,
     allow_semantic_edges: bool,
     output_path: Path,
+    llm_client: Any | None = None,
 ) -> dict[str, Any]:
     report = CorpusPlanner(
         sampler,
@@ -183,13 +195,21 @@ def _generate_run(
     ).sample_corpus(count)
     executor = OfflineExecutor(registry)
     config = GeneratorConfig()
+    if llm_client is not None:
+        planner, user_simulator, assistant = make_llm_agents(
+            client=llm_client, registry=registry, config=config
+        )
+    else:
+        planner = DeterministicPlanner(registry, config=config)
+        user_simulator = DeterministicUser()
+        assistant = DeterministicAssistant()
     coordinator = ConversationCoordinator(
         registry=registry,
         graph=graph,
         executor=executor,
-        planner=DeterministicPlanner(registry, config=config),
-        user_simulator=DeterministicUser(),
-        assistant=DeterministicAssistant(),
+        planner=planner,
+        user_simulator=user_simulator,
+        assistant=assistant,
         config=config,
     )
     with output_path.open("w", encoding="utf-8") as handle:
@@ -205,6 +225,7 @@ def _generate_run(
         "conversations": conversations,
         "generation": {
             "steering_enabled": steering_enabled,
+            "llm_generation": llm_client is not None,
             "requested": count,
             "generated": len(report.results),
             "failures": len(report.failures),

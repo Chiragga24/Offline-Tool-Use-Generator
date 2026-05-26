@@ -51,7 +51,7 @@ by default, with all LLM features behind opt-in flags.
 
 Steering widens coverage without hurting quality. Full breakdown in §10.
 
-**Test status:** 182 non-live tests pass without credentials
+**Test status:** 185 non-live tests pass without credentials
 (`pytest -m "not live"`); five `@pytest.mark.live` tests run when API
 keys are present and skip cleanly otherwise.
 
@@ -206,6 +206,13 @@ This is what the graph's grounding logic reads — see §4.
 | Tolerant normalization (preserve incomplete endpoints) | Strict validation that rejects | ToolBench data is inconsistent; rejecting kills coverage. |
 | Pydantic types throughout | Pass raw dicts downstream | Centralising parsing keeps every later module simpler. |
 | LLM enrichment is structured-output + whitelist | Free-text LLM output | A bad LLM canonical name would silently miswire the graph. |
+
+LLM enrichment failures are contained: `enrich_registry` catches any
+enricher exception (provider quota/outage, malformed response), records
+it in `report.errors`, and stops the LLM pass. Deterministic enrichment
+has already applied, so the build/generate/diversity command never
+aborts on a provider error — it just falls back to deterministic
+aliases.
 
 ### Honest gaps
 
@@ -523,10 +530,11 @@ and falls back per-call on any failure (provider exception, malformed
 JSON, Pydantic validation error, plan/chain shape mismatch). The
 fallback records `last_run = {"path": "fallback", "reason": "..."}`,
 which the coordinator includes in metadata so the judge and downstream
-analysis can see which conversations were LLM-driven. The CLI
-`diversity` command intentionally keeps generation deterministic even
-under `--use-llm`; it uses the hosted model for enrichment and judging,
-not for the Run A/Run B generator itself.
+analysis can see which conversations were LLM-driven. The `generate`
+and `diversity` commands both route through these agents under
+`--use-llm`; without it (the default and the reproducible baseline)
+they use the deterministic agents. See §12 for the diversity
+reproducibility tradeoff.
 
 ### LLM failure modes
 
@@ -945,10 +953,33 @@ across commands consistently:
 | `build` | Enables structured-output registry enrichment + semantic graph. |
 | `generate` | Loads built artifacts; uses LLM agents (with deterministic fallback per turn); enables semantic-edge traversal. |
 | `evaluate` | Enables LLM judge; if `--repair` set, also enables LLM repair planner. |
-| `diversity` | Enables structured-output registry enrichment, semantic graph construction, semantic-edge traversal, and LLM judging. Generation remains deterministic so Run A/Run B isolate cross-conversation steering rather than model variance. |
+| `diversity` | Enables registry enrichment, semantic graph, semantic-edge traversal, LLM judging, **and LLM generator agents for both runs** (with deterministic fallback per turn). One `StructuredLLMClient` serves all three LLM features. |
 
 Individual legacy flags (`--llm-judge`, `--llm-enrich-registry`) are
 preserved for targeted runs.
+
+**Diversity + LLM generation: the reproducibility tradeoff.** The
+default `kgmle diversity` (no `--use-llm`) generates both runs
+deterministically — the reproducible baseline that isolates steering
+from model variance, and the one used for the result table in §10.
+`--use-llm diversity` additionally routes both runs through LLM
+generator agents. We made this opt-in-under-`--use-llm` rather than
+deterministic-only because a reviewer with their own API quota should
+be able to run the full pipeline (including LLM generation) end to
+end; we could not, on free-tier quota.
+
+The honest caveat: LLM generation introduces model variance, so a
+`--use-llm` Run A vs Run B comparison is no longer purely attributable
+to steering. This matters less than it sounds because the **diversity
+metrics are chain-based** — they are computed from
+`metadata.final_chain`, which comes from the sampler, not the
+generator. LLM generation only changes a chain when the assistant
+proposes an *accepted* `ChainDeviation` (rare, confidence-gated). So
+the diversity numbers stay primarily a function of steering even under
+`--use-llm`; what changes is the *quality* metrics (naturalness reads
+better) and the realism of the conversation text. Both runs use the
+same client and the same per-chain seeds, so they remain as comparable
+as LLM nondeterminism allows.
 
 ## 13. Testing
 

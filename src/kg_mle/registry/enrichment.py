@@ -81,6 +81,10 @@ class FieldEnrichmentSuggestion(BaseModel):
 class RegistryEnrichmentReport(BaseModel):
     accepted: list[FieldEnrichmentSuggestion] = Field(default_factory=list)
     rejected: list[FieldEnrichmentSuggestion] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    """Provider/parse failures during LLM enrichment. Non-empty means the
+    LLM pass was cut short (e.g., a provider quota error); deterministic
+    enrichment still applied. The pipeline does not abort on these."""
 
 
 class RegistryEnricher(Protocol):
@@ -254,7 +258,15 @@ def enrich_registry(
     for endpoint in registry.endpoints:
         if max_llm_endpoints is not None and enriched_endpoint_count >= max_llm_endpoints:
             break
-        suggestions = enricher.suggest(endpoint)
+        try:
+            suggestions = enricher.suggest(endpoint)
+        except Exception as exc:
+            # Provider quota/outage, network, or malformed-response errors
+            # must not abort the pipeline. Deterministic enrichment already
+            # applied above; record the failure and stop the LLM pass (a
+            # quota error will only repeat on the next endpoint).
+            report.errors.append(f"{endpoint.endpoint_id}: {exc}")
+            break
         if suggestions:
             enriched_endpoint_count += 1
         for suggestion in suggestions:
