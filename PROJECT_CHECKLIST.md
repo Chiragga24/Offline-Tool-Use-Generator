@@ -211,20 +211,20 @@ Testing reminder:
 
 ### 5. Offline Tool Execution
 
-- [ ] Implement schema-derived mock output generation.
-- [ ] Maintain per-conversation session state.
-- [ ] Generate stable IDs and names from seeded random state.
-- [ ] Ensure later tool calls can use IDs returned by earlier tool outputs.
-- [ ] Validate tool-call arguments against normalized endpoint parameters.
-- [ ] Validate mocked outputs against expected lightweight schema.
-- [ ] Add deterministic fallback behavior when schemas are incomplete.
-- [ ] Document offline execution model in `DESIGN.md`.
-- [ ] Add unit tests for output generation.
-- [ ] Add unit tests for chained ID grounding.
+- [x] Implement schema-derived mock output generation (MockResponseGenerator with canonical example pools + ID prefixes).
+- [x] Maintain per-conversation session state (SessionState with issued-values index + chronological log).
+- [x] Generate stable IDs and names from seeded random state.
+- [x] Ensure later tool calls can use IDs returned by earlier tool outputs (suggest_arguments + example_values both source from session state).
+- [x] Validate tool-call arguments against normalized endpoint parameters (Pydantic dynamic model + grounding check).
+- [ ] Validate mocked outputs against expected lightweight schema (deferred; mocks ARE schema-derived so they conform by construction).
+- [x] Add deterministic fallback behavior when schemas are incomplete (typed defaults per ParameterType).
+- [x] Document offline execution model in `DESIGN.md` (§13.7).
+- [x] Add unit tests for output generation.
+- [x] Add unit tests for chained ID grounding.
 
 Testing reminder:
 
-- [ ] Test that booking/detail/update endpoints use IDs produced by search/list/create endpoints.
+- [x] Test that booking/detail/update endpoints use IDs produced by search/list/create endpoints (test_grounded_id_from_previous_step_validates, test_hallucinated_grounded_id_is_rejected).
 
 ### 6. Multi-Agent Conversation Generator
 

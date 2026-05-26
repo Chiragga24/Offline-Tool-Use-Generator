@@ -1154,10 +1154,172 @@ reduces top-endpoint concentration by 11 percentage points, with no
 loss in multi-step coverage. These are the seeds for the formal
 diversity metrics computed in §15 (TBD).
 
+## 13.7 Offline Tool Execution Model
+
+The executor is the layer that turns a sampled chain into a realised
+sequence of (tool_call, tool_response) pairs without invoking real APIs.
+It is the assignment §3 requirement, and it is also the within-conversation
+grounding implementation called out in §5.1.
+
+```text
+src/kg_mle/executor/
+├── state.py       # SessionState, LogEntry — per-conversation memory
+├── mocks.py       # MockResponseGenerator + canonical example pools
+├── validator.py   # Pydantic-shaped + grounded-arg validation, typed errors
+└── session.py     # ExecutorSession, OfflineExecutor — what the generator drives
+```
+
+### How It Works (Short Version)
+
+1. `OfflineExecutor` is constructed once per pipeline run; it holds the
+   registry handle.
+2. For each conversation, the generator calls `open_session(sampling_result, seed=...)`.
+   That returns a fresh `ExecutorSession` whose `SessionState` starts
+   empty.
+3. On every tool call:
+   - the session records the call in the conversation log,
+   - validates arguments via a dynamic Pydantic model + a strict grounding
+     check that compares each grounded parameter to the session's
+     issued-values index,
+   - on failure, records a `tool_error` entry in the log and raises a
+     typed exception (the repair loop reads both),
+   - on success, generates a schema-consistent mock response, registers
+     every string-valued response field into the issued-values index
+     (under literal *and* canonical name), and records the response in
+     the log.
+4. The generator can preview-and-shape calls via:
+   - `suggest_arguments(endpoint_id)` — plausible defaults derived from
+     session state for grounded params and a canonical example pool for
+     free params;
+   - `example_values(endpoint_id)` — few-shot pool the generator can
+     show the LLM: real issued IDs for grounded params, canonical
+     example pool for free params.
+
+### Design Decisions
+
+**Design decision:** Mocks are deterministic-by-default; an LLM polish
+pass is opt-in only.
+
+**Alternative considered:** LLM-generated responses by default,
+deterministic only as a fallback.
+
+**Reason rejected:** Every response field that the next call grounds
+into must be byte-stable for the conversation to be reproducible from
+a seed. LLM responses are non-deterministic in temperature ≥ 0 and
+costly across hundreds of calls. Deterministic mocks for the chain
+critical path plus optional LLM polish for descriptive fields (planned
+flag `--llm-mock-polish`) keeps the offline pipeline functional without
+credentials while preserving the upgrade path.
+
+---
+
+**Design decision:** The executor is a *stateful session* the generator
+drives one tool call at a time.
+
+**Alternative considered:** A batch `run_chain(sampling_result)` that
+executes the entire chain at once and returns a list of
+(call, response) pairs.
+
+**Reason rejected:** The multi-agent generator needs to interleave
+clarifying questions, user replies, and tool calls. With a batch
+runner, the executor would have to know about non-tool turns or be
+called repeatedly with growing chain prefixes — both ugly. A stateful
+session matches the conversation's actual control flow.
+
+---
+
+**Design decision:** Argument *synthesis* lives in the executor
+(`suggest_arguments`, `example_values`); argument *override* is the
+generator's prerogative.
+
+**Alternative considered:** Argument synthesis is the generator's job;
+the executor only validates and mocks.
+
+**Reason rejected:** The executor already owns the schema, the
+canonical example pool, and the issued-values index — three of the
+four inputs needed to pick a plausible default. Making the generator
+re-derive defaults would duplicate this knowledge across modules.
+Instead, the executor exposes `suggest_arguments` as the easy-path API
+and `example_values` as a few-shot pool the generator can render into
+the LLM prompt. Generator overrides go through the same validator, so
+there is no privileged caller and no trust gap.
+
+---
+
+**Design decision:** Failures raise typed exceptions *and* appear as
+`role: "tool"` entries in the conversation log. No "permissive mode"
+flag.
+
+**Alternative considered:** Toggle the executor between "raise on
+violation" and "return mock error payload" via a flag.
+
+**Reason rejected:** The repair loop needs control flow (catch on
+failure, retry with corrected args). A typed exception is the cleanest
+control-flow signal. The log entry is what gives the reviewer
+visibility — a flag would have made one of those two needs hard to
+satisfy. Surfacing both at once means the conversation trace tells the
+full story of what went wrong, in the same stream the assistant's good
+calls live in.
+
+---
+
+**Design decision:** Strict grounding applies to all grounded
+parameters, not just ID-shaped ones.
+
+**Alternative considered:** Only enforce grounding on `*_id`-shaped
+parameters; let other grounded params (city, symbol, date) pass through
+without a session-state check.
+
+**Reason rejected:** The sampler's grounded transitions describe an
+output-to-input promise at the field-name level, not the ID level.
+`finance/search_symbol -> finance/get_quote` is grounded via `symbol`;
+if the assistant invented a symbol that `search_symbol` never returned,
+the chain is incoherent and the judge's "tool correctness" score
+should penalize it. Strict-everywhere keeps the executor honest about
+what "groundedness" means.
+
+---
+
+**Design decision:** Session state registers every string-valued
+response field, not just IDs, keyed by both literal and canonical
+name.
+
+**Alternative considered:** Register only ID-shaped fields.
+
+**Reason rejected:** A direct consequence of the strict-grounding
+decision above. Non-ID grounded transitions (the `symbol` case) need
+the same lookup path as ID grounded transitions. Indexing under both
+literal and canonical name handles the case where the enrichment layer
+mapped the field to a canonical (`destination -> city`) and the next
+endpoint's required parameter is the canonical form.
+
+### Sample Trace (Conversation Log)
+
+A 3-step chain with a deliberate hallucinated grounded argument in step 2:
+
+```json
+{"role": "assistant", "tool_calls": [{"endpoint": "travel/search_flights",
+   "arguments": {"origin": "...", "destination": "Paris", "date": "2026-04-11"}}]}
+{"role": "tool", "endpoint": "travel/search_flights",
+   "content": {"flight_id": "flt_lfxctn", "airline": "Airline 8", "price": "299.50"}}
+{"role": "assistant", "tool_calls": [{"endpoint": "travel/book_itinerary",
+   "arguments": {"flight_id": "made_up_value", "hotel_id": "...", "traveler_name": "..."}}]}
+{"role": "tool", "endpoint": "travel/book_itinerary",
+   "content": {"error": {"kind": "ungrounded_argument",
+                          "parameter": "flight_id",
+                          "expected_one_of": ["flt_lfxctn"]}}}
+{"role": "assistant", "tool_calls": [{"endpoint": "travel/book_itinerary",
+   "arguments": {"flight_id": "flt_lfxctn", "hotel_id": "...", "traveler_name": "..."}}]}
+{"role": "tool", "endpoint": "travel/book_itinerary",
+   "content": {"booking_id": "bk_bpcdp3", "status": "Status 16"}}
+```
+
+A reviewer can trace the rejection, the repair, and the recovery
+without consulting any external log.
+
 ## 14. Open Design Areas
 
 Still to implement:
-- Offline executor with stateful mocked outputs
 - Multi-agent conversation generator
 - Deterministic evaluator plus optional Gemma-backed judge
 - Retry/repair loop
