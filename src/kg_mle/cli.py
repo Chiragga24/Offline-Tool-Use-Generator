@@ -13,6 +13,7 @@ from kg_mle.config import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_EMBEDDING_PROVIDER,
     DEFAULT_INPUT_PATH,
+    DEFAULT_LLM_CONFIG,
     DEFAULT_MEM0_LLM_CONFIG,
     DEFAULT_REGISTRY_PATH,
     DEFAULT_SEMANTIC_BACKEND,
@@ -21,7 +22,7 @@ from kg_mle.config import (
 )
 from kg_mle.graph import build_tool_graph, save_tool_graph
 from kg_mle.graph.semantic import Mem0SemanticRetriever, SentenceTransformerSemanticRetriever
-from kg_mle.registry import load_registry, save_registry
+from kg_mle.registry import HuggingFaceRegistryEnricher, enrich_registry, load_registry, save_registry
 from kg_mle.utils.logging import configure_logging, get_logger
 from kg_mle.utils.paths import ensure_dir, ensure_parent_dir
 
@@ -93,11 +94,56 @@ def build(
         int,
         typer.Option("--semantic-top-k", min=1, help="Semantic neighbors per endpoint."),
     ] = DEFAULT_SEMANTIC_TOP_K,
+    enrich_registry_fields: Annotated[
+        bool,
+        typer.Option(
+            "--enrich-registry-fields/--no-enrich-registry-fields",
+            help="Apply deterministic registry field alias/type enrichment.",
+        ),
+    ] = True,
+    llm_enrich_registry: Annotated[
+        bool,
+        typer.Option(
+            "--llm-enrich-registry/--no-llm-enrich-registry",
+            help="Use configured LLM for structured registry alias/type enrichment.",
+        ),
+    ] = False,
+    registry_enrichment_threshold: Annotated[
+        float,
+        typer.Option("--registry-enrichment-threshold", help="Minimum LLM enrichment confidence."),
+    ] = 0.80,
+    max_llm_registry_endpoints: Annotated[
+        int,
+        typer.Option(
+            "--max-llm-registry-endpoints",
+            min=1,
+            help="Maximum endpoints to send to live LLM registry enrichment.",
+        ),
+    ] = 5,
 ) -> None:
     """Ingest ToolBench-style definitions and build derived artifacts."""
     ensure_dir(artifacts_dir)
     logger.info("Build command starting")
     registry = load_registry(input_path)
+    enrichment_report = None
+    if enrich_registry_fields:
+        registry_enricher = None
+        if llm_enrich_registry:
+            if DEFAULT_LLM_CONFIG.provider != "huggingface":
+                raise typer.BadParameter(
+                    "registry LLM enrichment currently supports KG_MLE_LLM_PROVIDER=huggingface"
+                )
+            registry_enricher = HuggingFaceRegistryEnricher(
+                model=DEFAULT_LLM_CONFIG.model,
+                api_key=DEFAULT_LLM_CONFIG.api_key,
+                provider=DEFAULT_LLM_CONFIG.extra.get("hf_provider"),
+            )
+        enrichment_report = enrich_registry(
+            registry,
+            enricher=registry_enricher,
+            confidence_threshold=registry_enrichment_threshold,
+            max_llm_endpoints=max_llm_registry_endpoints if registry_enricher else None,
+        )
     registry_path = artifacts_dir / DEFAULT_REGISTRY_PATH.name
     save_registry(registry, registry_path)
     semantic_retriever = None
@@ -127,6 +173,7 @@ def build(
         "[green]built artifacts[/green]: "
         f"tools={len(registry.tools)} endpoints={registry.endpoint_count()} "
         f"nodes={graph.node_count()} edges={graph.edge_count()} "
+        f"registry_enrichments={len(enrichment_report.accepted) if enrichment_report else 0} "
         f"registry={registry_path} graph={graph_path}"
     )
 

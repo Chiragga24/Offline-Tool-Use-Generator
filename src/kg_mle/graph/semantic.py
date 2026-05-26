@@ -52,7 +52,14 @@ class Mem0SemanticRetriever:
         llm_model: str,
         llm_api_key: str | None = None,
         llm_base_url: str | None = None,
+        memory: object | None = None,
     ) -> None:
+        self._user_id = "kg_mle_tool_graph"
+        self._endpoint_ids_by_text: dict[str, str] = {}
+        if memory is not None:
+            self._memory = memory
+            return
+
         try:
             from mem0 import Memory  # type: ignore
         except ImportError as exc:
@@ -101,8 +108,6 @@ class Mem0SemanticRetriever:
                 "Mem0 fully, for example with GOOGLE_API_KEY for Gemini, "
                 "or use --semantic-backend local for offline MiniLM retrieval."
             ) from exc
-        self._user_id = "kg_mle_tool_graph"
-        self._endpoint_ids_by_text: dict[str, str] = {}
 
     def index(self, cards: list[EndpointCard]) -> None:
         for card in cards:

@@ -14,6 +14,17 @@ def test_load_llm_provider_config_infers_api_key_env(monkeypatch):
     assert config.api_key == "test-key"
 
 
+def test_load_llm_provider_config_supports_hf_provider_hint(monkeypatch):
+    monkeypatch.setenv("KG_MLE_LLM_PROVIDER", "huggingface")
+    monkeypatch.setenv("KG_MLE_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct")
+    monkeypatch.setenv("KG_MLE_HF_PROVIDER", "featherless-ai")
+
+    config = load_llm_provider_config()
+
+    assert config.provider == "huggingface"
+    assert config.extra["hf_provider"] == "featherless-ai"
+
+
 def test_load_llm_provider_config_supports_local_base_url(monkeypatch):
     monkeypatch.setenv("KG_MLE_LLM_PROVIDER", "ollama")
     monkeypatch.setenv("KG_MLE_LLM_MODEL", "gemma4")
@@ -38,4 +49,3 @@ def test_load_mem0_llm_provider_config_uses_mem0_env_prefix(monkeypatch):
     assert config.model == "deepseek-chat"
     assert config.api_key_env == "DEEPSEEK_API_KEY"
     assert config.api_key == "test-key"
-

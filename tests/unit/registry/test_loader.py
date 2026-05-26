@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from kg_mle.config import DEFAULT_INPUT_PATH
 from kg_mle.registry import load_registry, normalize_tools, save_registry
 from kg_mle.registry.loader import normalize_type
@@ -62,6 +64,105 @@ def test_normalize_tools_handles_minimal_raw_tool():
     assert endpoint.parameters[0].name == "item_id"
     assert endpoint.parameters[0].type == "string"
     assert endpoint.parameters[0].required is True
+
+
+def test_normalize_tools_handles_flat_response_field_map():
+    """ToolBench data often uses flat {field: type} response maps, not JSON Schema."""
+    registry = normalize_tools(
+        [
+            {
+                "category": "Travel",
+                "tool_name": "flat_hotels",
+                "api_list": [
+                    {
+                        "name": "search",
+                        "required_parameters": [{"name": "city", "type": "string"}],
+                        "response_schema": {
+                            "hotel_id": "string",
+                            "name": "STRING",
+                            "price": "number",
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    endpoint = registry.endpoints[0]
+    field_types = {field.name: field.type for field in endpoint.response_fields}
+    assert field_types == {"hotel_id": "string", "name": "string", "price": "number"}
+
+
+def test_normalize_tools_handles_list_response_field_shape():
+    """Some ToolBench-style schemas use [{name, type, description}, ...]."""
+    registry = normalize_tools(
+        [
+            {
+                "category": "Finance",
+                "tool_name": "quotes",
+                "api_list": [
+                    {
+                        "name": "get_quote",
+                        "required_parameters": [{"name": "symbol", "type": "string"}],
+                        "response_schema": [
+                            {"name": "price", "type": "number", "description": "Last trade."},
+                            {"name": "currency", "type": "string"},
+                            {"type": "string", "description": "skipped — no name."},
+                            {"field": "exchange", "type": "string"},
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+
+    endpoint = registry.endpoints[0]
+    field_names = [field.name for field in endpoint.response_fields]
+    assert field_names == ["price", "currency", "exchange"]
+    assert endpoint.response_fields[0].description == "Last trade."
+
+
+def test_normalize_tools_does_not_misinterpret_json_schema_shell_as_flat_map():
+    """A response_schema with only `type` and `properties` should stay JSON-Schema."""
+    registry = normalize_tools(
+        [
+            {
+                "category": "Sports",
+                "tool_name": "teams",
+                "api_list": [
+                    {
+                        "name": "get_team",
+                        "required_parameters": [{"name": "team_id", "type": "string"}],
+                        "response_schema": {
+                            "type": "object",
+                            "properties": {"team_id": {"type": "string"}},
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    endpoint = registry.endpoints[0]
+    assert [field.name for field in endpoint.response_fields] == ["team_id"]
+
+
+def test_normalize_tools_raises_on_duplicate_endpoint_id():
+    raw_tools = [
+        {
+            "category": "Travel",
+            "tool_name": "flights_tool",
+            "api_list": [{"name": "search", "required": [{"name": "city"}]}],
+        },
+        {
+            "category": "Travel",
+            "tool_name": "hotels_tool",
+            "api_list": [{"name": "search", "required": [{"name": "city"}]}],
+        },
+    ]
+
+    with pytest.raises(ValueError, match="Duplicate endpoint_id 'travel/search'"):
+        normalize_tools(raw_tools)
 
 
 def test_save_registry_round_trips_json(tmp_path):

@@ -36,6 +36,7 @@ def load_registry(input_path: Path | str) -> ToolRegistry:
 
 def normalize_tools(raw_tools: list[dict[str, Any]]) -> ToolRegistry:
     tools: list[Tool] = []
+    seen_endpoint_ids: dict[str, str] = {}
     for raw_tool in raw_tools:
         category = str(raw_tool.get("category") or "uncategorized")
         domain = _normalize_domain(category)
@@ -50,6 +51,16 @@ def normalize_tools(raw_tools: list[dict[str, Any]]) -> ToolRegistry:
             _normalize_endpoint(raw_api, category=category, domain=domain, tool_name=tool_name)
             for raw_api in raw_tool.get("api_list", []) or []
         ]
+        for endpoint in endpoints:
+            existing_tool = seen_endpoint_ids.get(endpoint.endpoint_id)
+            if existing_tool is not None:
+                raise ValueError(
+                    f"Duplicate endpoint_id {endpoint.endpoint_id!r}: tools "
+                    f"{existing_tool!r} and {tool_name!r} both expose this endpoint. "
+                    "Endpoint IDs use 'domain/name' format; rename the colliding "
+                    "endpoint or expose unique endpoint names within the domain."
+                )
+            seen_endpoint_ids[endpoint.endpoint_id] = tool_name
         tools.append(
             Tool(
                 domain=domain,
@@ -124,7 +135,6 @@ def _normalize_endpoint(
         description=description,
         parameters=parameters,
         response_fields=response_fields,
-        raw_schema=raw_api,
     )
 
 
@@ -168,16 +178,27 @@ def _normalize_parameters(raw_api: dict[str, Any], kind: str, *, required: bool)
 
 
 def _normalize_response_fields(raw_api: dict[str, Any]) -> list[ResponseField]:
-    schema = raw_api.get("response_schema")
-    if not isinstance(schema, dict) or not schema:
+    schema: Any = raw_api.get("response_schema")
+    if schema is None or schema == "" or schema == {} or schema == []:
         schema = raw_api.get("response")
-    if not isinstance(schema, dict):
+    if schema is None:
         return []
 
-    properties = schema.get("properties")
-    if not isinstance(properties, dict):
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return _fields_from_properties(properties)
+        if _looks_like_flat_field_map(schema):
+            return _fields_from_flat_map(schema)
         return []
 
+    if isinstance(schema, list):
+        return _fields_from_field_list(schema)
+
+    return []
+
+
+def _fields_from_properties(properties: dict[str, Any]) -> list[ResponseField]:
     fields: list[ResponseField] = []
     for field_name, field_schema in properties.items():
         if not isinstance(field_schema, dict):
@@ -187,6 +208,69 @@ def _normalize_response_fields(raw_api: dict[str, Any]) -> list[ResponseField]:
                 name=str(field_name),
                 type=normalize_type(field_schema.get("type")),
                 description=str(field_schema.get("description") or ""),
+            )
+        )
+    return fields
+
+
+def _looks_like_flat_field_map(schema: dict[str, Any]) -> bool:
+    """Detect ToolBench-style flat response maps like {'hotel_id': 'string'}.
+
+    Distinguish from JSON-Schema shells whose top-level keys are schema
+    keywords (type, properties, required, items, ...).
+    """
+    schema_keywords = {
+        "type",
+        "properties",
+        "required",
+        "items",
+        "additionalProperties",
+        "oneOf",
+        "anyOf",
+        "allOf",
+        "$ref",
+        "$schema",
+        "description",
+        "title",
+        "enum",
+    }
+    if not schema:
+        return False
+    return not any(key in schema_keywords for key in schema.keys())
+
+
+def _fields_from_flat_map(schema: dict[str, Any]) -> list[ResponseField]:
+    fields: list[ResponseField] = []
+    for field_name, value in schema.items():
+        if isinstance(value, dict):
+            type_hint = value.get("type")
+            description = str(value.get("description") or "")
+        else:
+            type_hint = value
+            description = ""
+        fields.append(
+            ResponseField(
+                name=str(field_name),
+                type=normalize_type(type_hint),
+                description=description,
+            )
+        )
+    return fields
+
+
+def _fields_from_field_list(schema: list[Any]) -> list[ResponseField]:
+    fields: list[ResponseField] = []
+    for item in schema:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("field")
+        if not name:
+            continue
+        fields.append(
+            ResponseField(
+                name=str(name),
+                type=normalize_type(item.get("type")),
+                description=str(item.get("description") or ""),
             )
         )
     return fields

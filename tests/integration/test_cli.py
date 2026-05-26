@@ -37,6 +37,7 @@ def test_build_command_writes_registry_and_graph(tmp_path):
 
     assert result.exit_code == 0
     assert "built artifacts" in result.output
+    assert "registry_enrichments=" in result.output
     assert (tmp_path / "registry.json").exists()
     assert (tmp_path / "tool_graph.json").exists()
 

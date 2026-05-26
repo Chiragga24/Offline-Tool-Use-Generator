@@ -2,15 +2,28 @@
 
 from kg_mle.registry.loader import load_registry, normalize_tools, save_registry
 from kg_mle.registry.models import Endpoint, Parameter, ResponseField, Tool, ToolRegistry
+from kg_mle.registry.enrichment import (
+    FakeRegistryEnricher,
+    FieldEnrichmentSuggestion,
+    HuggingFaceRegistryEnricher,
+    RegistryEnrichmentReport,
+    enrich_registry,
+    unresolved_fields,
+)
 
 __all__ = [
     "Endpoint",
+    "FakeRegistryEnricher",
+    "FieldEnrichmentSuggestion",
+    "HuggingFaceRegistryEnricher",
     "Parameter",
+    "RegistryEnrichmentReport",
     "ResponseField",
     "Tool",
     "ToolRegistry",
+    "enrich_registry",
     "load_registry",
     "normalize_tools",
     "save_registry",
+    "unresolved_fields",
 ]
-

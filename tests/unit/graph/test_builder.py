@@ -2,7 +2,7 @@ import json
 
 from kg_mle.config import DEFAULT_INPUT_PATH
 from kg_mle.graph import FakeSemanticRetriever, SemanticMatch, build_tool_graph, save_tool_graph
-from kg_mle.registry import load_registry
+from kg_mle.registry import enrich_registry, load_registry, normalize_tools
 
 
 def test_build_tool_graph_from_registry_creates_core_nodes_and_edges():
@@ -107,6 +107,109 @@ def test_build_tool_graph_does_not_duplicate_deterministic_edges_as_semantic_edg
         "endpoint:travel/search_hotels",
         "endpoint:travel/get_hotel_details",
         "semantic_related",
+    )
+
+
+def test_grounding_edges_use_enrichment_aliases():
+    """Enrichment-derived canonical names should expand output-to-input matching.
+
+    Without enrichment, a response field named `city` does not satisfy a parameter
+    named `destination`. After deterministic enrichment maps `destination -> city`,
+    the grounding edge must appear.
+    """
+    raw_tools = [
+        {
+            "category": "Travel",
+            "tool_name": "city_lookup",
+            "api_list": [
+                {
+                    "name": "find_city",
+                    "required_parameters": [{"name": "query", "type": "string"}],
+                    "response_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+                {
+                    "name": "plan_trip",
+                    "required_parameters": [{"name": "destination", "type": "string"}],
+                    "response_schema": {
+                        "type": "object",
+                        "properties": {"itinerary_id": {"type": "string"}},
+                    },
+                },
+            ],
+        }
+    ]
+    registry = normalize_tools(raw_tools)
+
+    pre_graph = build_tool_graph(registry)
+    assert not pre_graph.has_edge(
+        "endpoint:travel/find_city",
+        "endpoint:travel/plan_trip",
+        "output_satisfies_input",
+    )
+
+    enrich_registry(registry)
+    post_graph = build_tool_graph(registry)
+    assert post_graph.has_edge(
+        "endpoint:travel/find_city",
+        "endpoint:travel/plan_trip",
+        "output_satisfies_input",
+    )
+    edge = next(
+        edge
+        for edge in post_graph.edges
+        if edge.source == "endpoint:travel/find_city"
+        and edge.target == "endpoint:travel/plan_trip"
+        and edge.type == "output_satisfies_input"
+    )
+    assert edge.metadata["match_type"] in {"canonical", "alias"}
+    assert edge.metadata["source_field"] == "city"
+
+
+def test_grounding_edges_allow_common_field_chaining():
+    """Cross-domain chains via fields like `city` must now form grounding edges."""
+    raw_tools = [
+        {
+            "category": "Travel",
+            "tool_name": "search_tool",
+            "api_list": [
+                {
+                    "name": "search_hotels",
+                    "required_parameters": [{"name": "query", "type": "string"}],
+                    "response_schema": {
+                        "type": "object",
+                        "properties": {
+                            "hotel_id": {"type": "string"},
+                            "city": {"type": "string"},
+                        },
+                    },
+                }
+            ],
+        },
+        {
+            "category": "Weather",
+            "tool_name": "forecast_tool",
+            "api_list": [
+                {
+                    "name": "get_forecast",
+                    "required_parameters": [{"name": "city", "type": "string"}],
+                    "response_schema": {
+                        "type": "object",
+                        "properties": {"forecast": {"type": "string"}},
+                    },
+                }
+            ],
+        },
+    ]
+    registry = normalize_tools(raw_tools)
+    graph = build_tool_graph(registry)
+
+    assert graph.has_edge(
+        "endpoint:travel/search_hotels",
+        "endpoint:weather/get_forecast",
+        "output_satisfies_input",
     )
 
 

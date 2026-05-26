@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -12,12 +12,22 @@ class Parameter(BaseModel):
     type: ParameterType = "string"
     required: bool
     description: str
+    canonical_name: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    type_confidence: float | None = None
+    alias_confidence: float | None = None
+    enrichment_source: str | None = None
 
 
 class ResponseField(BaseModel):
     name: str
     type: ParameterType = "string"
     description: str = ""
+    canonical_name: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    type_confidence: float | None = None
+    alias_confidence: float | None = None
+    enrichment_source: str | None = None
 
 
 class Endpoint(BaseModel):
@@ -31,7 +41,6 @@ class Endpoint(BaseModel):
     description: str
     parameters: list[Parameter] = Field(default_factory=list)
     response_fields: list[ResponseField] = Field(default_factory=list)
-    raw_schema: dict[str, Any] = Field(default_factory=dict)
 
 
 class Tool(BaseModel):
@@ -51,4 +60,3 @@ class ToolRegistry(BaseModel):
 
     def endpoint_count(self) -> int:
         return len(self.endpoints)
-

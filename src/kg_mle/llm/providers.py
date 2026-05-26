@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -8,6 +8,7 @@ class LLMProviderConfig:
     model: str
     api_key_env: str | None = None
     base_url: str | None = None
+    extra: dict[str, str] = field(default_factory=dict)
 
     @property
     def api_key(self) -> str | None:
@@ -55,12 +56,18 @@ def load_llm_provider_config(
     model = os.getenv(model_env, DEFAULT_PROVIDER_MODELS.get(provider, "local-model"))
     api_key_env = PROVIDER_API_KEY_ENV.get(provider)
     base_url = os.getenv(base_url_env)
+    extra = {}
+    if provider == "huggingface":
+        hf_provider = os.getenv("KG_MLE_HF_PROVIDER")
+        if hf_provider:
+            extra["hf_provider"] = hf_provider
 
     return LLMProviderConfig(
         provider=provider,
         model=model,
         api_key_env=api_key_env,
         base_url=base_url,
+        extra=extra,
     )
 
 
@@ -70,4 +77,3 @@ def load_mem0_llm_provider_config() -> LLMProviderConfig:
         model_env="KG_MLE_MEM0_LLM_MODEL",
         base_url_env="KG_MLE_MEM0_LLM_BASE_URL",
     )
-

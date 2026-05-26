@@ -221,6 +221,131 @@ Reason rejected:
 
 - Every downstream module would need repeated defensive parsing. Centralizing normalization keeps later components simpler and easier to test.
 
+### Response Schema Shapes
+
+ToolBench-style data uses several response-schema shapes inconsistently. The
+loader handles four:
+
+```text
+JSON Schema:        {"type": "object", "properties": {"hotel_id": {"type": "string"}}}
+flat field map:     {"hotel_id": "string", "name": "string"}
+list of field dicts:[{"name": "hotel_id", "type": "string"}, ...]
+missing/null/empty: -> empty list (no fields)
+```
+
+A flat map is distinguished from a JSON-Schema shell by checking whether the
+keys look like JSON-Schema keywords (`type`, `properties`, `items`, `oneOf`,
+etc.). If they do not, the dict is treated as a flat field map.
+
+### Endpoint ID Uniqueness
+
+`endpoint_id` is formatted as `domain/name`. If two tools in the same domain
+expose endpoints with the same name, the loader raises `ValueError` with both
+tool names. This prevents silent dict-keyed overwrites in downstream consumers.
+
+If you scale to full ToolBench data and hit a collision, either rename the
+colliding endpoints in the input or extend the ID format to include
+`tool_name`. The choice was made deliberately to keep `endpoint_id` short and
+human-readable in the curated subset, with a loud-fail safety net.
+
+### Removed: `raw_schema` Field
+
+Earlier iterations stored `raw_schema: dict[str, Any]` on every `Endpoint` and
+persisted it to `artifacts/registry.json`. It roughly doubled artifact size
+(~145 KB → ~97 KB after removal) and risked downstream code accidentally
+reading raw, unnormalized fields. It is removed. Debugging tools that need the
+raw payload should re-read the source JSON.
+
+### Registry Field Enrichment
+
+The registry also supports a constrained enrichment layer for canonical names, aliases, and type hints.
+
+Default behavior:
+
+```text
+deterministic normalization
+-> deterministic alias enrichment
+-> optional structured LLM-style suggestions
+```
+
+Deterministic examples:
+
+```text
+destination -> city
+venue -> location
+available_time -> start_time
+check_in -> date
+```
+
+The enrichment layer stores metadata on parameters and response fields:
+
+```text
+canonical_name
+aliases
+type_confidence
+alias_confidence
+enrichment_source
+```
+
+Design decision:
+
+- Do not let enrichment rename or delete original fields.
+- Preserve original schema names and add canonical metadata.
+
+Reason:
+
+- Original parameter names are needed for actual tool-call arguments.
+- Canonical metadata helps the graph and sampler reason across near-equivalent fields without losing traceability.
+
+Optional LLM-style suggestions are represented as structured Pydantic objects:
+
+```text
+FieldEnrichmentSuggestion
+├── endpoint_id
+├── target: parameter | response_field
+├── field_name
+├── canonical_name
+├── aliases
+├── type_hint
+├── confidence
+├── reason
+└── source
+```
+
+Guardrails:
+
+- suggestions must validate through Pydantic
+- `canonical_name` must be in the allowed canonical vocabulary
+- `type_hint` must be one of the internal registry types
+- confidence must be between 0 and 1
+- suggestions below threshold are rejected
+- suggestions for missing fields are rejected
+- original field names are never removed
+- deterministic normalization remains the fallback
+
+Design decision:
+
+- Use LLM-style structured enrichment only for unresolved alias/type cases, not as the primary registry normalizer.
+
+Reason:
+
+- The registry is the base contract for graph construction. Keeping deterministic normalization first preserves reproducibility, while structured enrichment demonstrates LLM-oriented schema repair capability in a controlled way.
+
+Future path:
+
+- Wire `FieldEnrichmentSuggestion` to an actual provider-backed structured-output LLM call.
+- Cache accepted enrichment suggestions into artifacts for reproducibility.
+- Compare deterministic-only vs enriched graph quality in the diversity experiment.
+
+Implementation status:
+
+- The structured suggestion schema, validation, confidence gating, and application logic are implemented.
+- A Hugging Face registry enricher is implemented behind `--llm-enrich-registry`.
+- Local live test with `KG_MLE_LLM_MODEL=google/gemma-4-E2B-it` reached Hugging Face, but the HF router reported that the configured model is not available as a chat model and has no text-generation provider mapping.
+- Live test with `KG_MLE_LLM_MODEL=Qwen/Qwen2.5-3B-Instruct` and `KG_MLE_HF_PROVIDER=featherless-ai` successfully reached a provider-backed conversational endpoint and returned JSON-shaped suggestions, proving the integration path works. A full run was stopped by provider billing/credit limits (`402 Payment Required`), so live LLM enrichment remains explicit opt-in.
+- Therefore live Gemma enrichment is not enabled by default. The deterministic and fake structured-enrichment paths remain fully tested.
+- To use live registry enrichment, configure a Hugging Face-hosted instruction model that supports the Inference API/router, or configure a future local provider such as Ollama, LM Studio, vLLM, or LiteLLM for Gemma.
+
 ## 7. Tool Graph
 
 The graph is a typed, JSON-serializable artifact.
@@ -322,6 +447,53 @@ Design decision:
 Reason:
 
 - It directly supports grounded tool chaining and reduces hallucinated arguments.
+
+### Alias-Aware Field Matching
+
+A response field satisfies a parameter when their identifier sets overlap. An
+identifier set is `{name, canonical_name (if set), *aliases}`. This means the
+matcher reads enrichment metadata directly off `Parameter` and `ResponseField`
+rather than from a hardcoded local alias table.
+
+Each grounding edge records the match strength in metadata:
+
+```text
+exact_name: parameter.name == field.name
+canonical:  match via canonical_name on either side
+alias:      match via an alias entry only
+```
+
+The sampler can later prefer `exact_name` edges over `alias` edges when
+weighting chain candidates.
+
+### What Changed And Why
+
+An earlier iteration of `_field_satisfies_parameter` used a module-level
+`COMMON_PARAMETER_NAMES` blocklist and a module-level `FIELD_ALIASES` dict.
+Both decisions hurt the graph:
+
+- The blocklist excluded `city`, `date`, `location`, `start_time`, `query`,
+  and other common fields. This made cross-domain chains like
+  `weather/get_forecast(city)` ungroundable from any other endpoint that
+  returned a `city` field, even though that is exactly the cross-domain
+  chaining the assignment requires.
+- The hardcoded alias dict bypassed the structured enrichment layer. The
+  enrichment work set `canonical_name = "city"` on `destination` parameters
+  but the matcher never read it; only the local table did. Enrichment was
+  effectively decorative.
+
+Removing the blocklist and routing matching through enrichment metadata
+unlocked 7 new cross-domain grounding edges in the fixture, including one
+(`food/check_availability.available_time -> events.start_time`) that is only
+possible because deterministic enrichment recognises `available_time` as a
+canonical alias of `start_time`. The same alias has been in the codebase
+since enrichment landed but was unused by the graph until now.
+
+The risk of false-positive matches (e.g., every endpoint returning `city`
+chaining into every endpoint that consumes `city`) is real but is a
+*sampler* concern, not a graph-construction concern. The graph should expose
+the truth; the sampler can downweight low-information matches using the
+`match_type` metadata recorded on each edge.
 
 ## 9. Semantic Graph Expansion
 
@@ -451,6 +623,25 @@ This means:
 
 This is the correct behavior for deterministic schema graph construction.
 
+### Mem0 Test Coverage
+
+The `Mem0SemanticRetriever` constructor accepts an injected `memory` object
+so its behavior can be tested without a live Mem0 install or provider
+credentials. Unit tests cover:
+
+- indexing always calls `Memory.add(..., infer=False)` with the correct
+  `user_id` and `endpoint_id` metadata
+- search-result parsing prefers `metadata.endpoint_id`, falls back to looking
+  up the previously-indexed text, and skips results that cannot be resolved
+- `search.filters` uses `{"user_id": "kg_mle_tool_graph"}`, not the
+  deprecated top-level entity parameters
+- results are capped at the requested `top_k`
+
+The real Mem0 path (with Hugging Face embeddings, Gemini LLM, and an
+in-memory Qdrant store) is exercised by hand during graph builds with
+`--semantic-backend mem0`, but is not in CI because it needs `HF_TOKEN` and
+`GOOGLE_API_KEY`. The injected-memory tests are the safety net.
+
 ## 10.1 LLM Provider Orchestration
 
 The project separates LLM provider configuration from business logic.
@@ -572,7 +763,7 @@ Deterministic graph:
 
 ```text
 nodes: 274
-edges: 468
+edges: 474
 
 node types:
 domain: 9
@@ -586,15 +777,34 @@ contains_tool: 9
 exposes_endpoint: 45
 requires_parameter: 101
 returns_field: 110
-output_satisfies_input: 23
+output_satisfies_input: 29
 same_domain: 180
+```
+
+`output_satisfies_input` match-type breakdown:
+
+```text
+exact_name: 28
+canonical:  1   (food/check_availability.available_time -> events.start_time)
+```
+
+Cross-domain grounding edges (the cases that hardcoded blocklists previously suppressed):
+
+```text
+sports/get_player_stats          -> gaming/recommend_games        (player_id)
+entertainment/search_live_shows  -> events/create_calendar_event  (start_time)
+gaming/search_games              -> sports/get_game_odds          (game_id)
+gaming/search_games              -> events/create_calendar_event  (title)
+gaming/get_tournament_schedule   -> events/create_calendar_event  (start_time)
+food/check_availability          -> events/create_calendar_event  (available_time -> start_time, canonical)
+weather/recommend_outdoor_window -> events/create_calendar_event  (start_time)
 ```
 
 Semantic graph with local MiniLM at threshold `0.78`:
 
 ```text
 nodes: 274
-edges: 472
+edges: 478
 semantic_related: 4
 ```
 
@@ -624,18 +834,22 @@ Current coverage:
 - path/config helpers
 - `.env` config override behavior
 - CLI smoke behavior
-- registry normalization
+- registry normalization (clean, messy, flat-dict responses, list-shaped responses, JSON-Schema shells)
 - registry persistence
+- registry enrichment (deterministic, structured-output suggestions, Hugging Face enricher with mocked client)
+- duplicate `endpoint_id` rejection
 - graph model validation
 - graph builder construction
-- grounding edge creation
+- grounding edge creation, including alias-driven grounding produced by enrichment
+- cross-domain grounding via common fields (`city`, `start_time`, etc.)
 - semantic edge filtering
 - local semantic retriever behavior through a mocked model
+- Mem0 retriever indexing and search-result parsing via an injected fake `Memory`
 
 Current result:
 
 ```text
-27 passed
+49 passed
 ```
 
 Design decision:

@@ -147,7 +147,8 @@ Testing reminder:
 - [x] Add schema normalization defaults.
 - [x] Persist normalized registry artifact as JSON.
 - [x] Add validation for required normalized fields.
-- [ ] Document data model choices in `DESIGN.md`.
+- [x] Add constrained registry field enrichment for aliases/type hints.
+- [x] Document data model choices in `DESIGN.md`.
 - [x] Add unit tests for clean input.
 - [x] Add unit tests for messy/incomplete input.
 
