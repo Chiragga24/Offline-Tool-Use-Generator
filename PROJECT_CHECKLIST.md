@@ -157,29 +157,29 @@ Testing reminder:
 
 ### 3. Tool Graph
 
-- [ ] Define graph node types:
+- [x] Define graph node types:
   - domain
   - tool
   - endpoint
   - parameter
   - output field
-- [ ] Define graph edge types:
+- [x] Define graph edge types:
   - tool belongs to domain
   - tool exposes endpoint
   - endpoint requires parameter
   - endpoint returns field
   - endpoint output can satisfy later parameter
   - semantically related endpoints
-- [ ] Build graph from normalized registry.
-- [ ] Persist graph artifact as JSON.
-- [ ] Add graph summary metrics.
-- [ ] Document graph schema and why these relationships support sampling.
-- [ ] Add unit tests for graph construction.
+- [x] Build graph from normalized registry.
+- [x] Persist graph artifact as JSON.
+- [x] Add graph summary metrics.
+- [x] Document graph schema and why these relationships support sampling.
+- [x] Add unit tests for graph construction.
 
 Testing reminder:
 
-- [ ] Test that output-to-input edges exist for ID-like fields.
-- [ ] Test graph artifact can round-trip through JSON.
+- [x] Test that output-to-input edges exist for ID-like fields.
+- [x] Test graph artifact can round-trip through JSON.
 
 ### 4. Tool-Chain Sampler
 

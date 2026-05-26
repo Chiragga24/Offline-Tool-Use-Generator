@@ -9,9 +9,18 @@ from kg_mle.config import (
     DEFAULT_ARTIFACTS_DIR,
     DEFAULT_DATASET_PATH,
     DEFAULT_EVALUATION_PATH,
+    DEFAULT_GRAPH_PATH,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_PROVIDER,
     DEFAULT_INPUT_PATH,
+    DEFAULT_MEM0_LLM_CONFIG,
     DEFAULT_REGISTRY_PATH,
+    DEFAULT_SEMANTIC_BACKEND,
+    DEFAULT_SEMANTIC_THRESHOLD,
+    DEFAULT_SEMANTIC_TOP_K,
 )
+from kg_mle.graph import build_tool_graph, save_tool_graph
+from kg_mle.graph.semantic import Mem0SemanticRetriever, SentenceTransformerSemanticRetriever
 from kg_mle.registry import load_registry, save_registry
 from kg_mle.utils.logging import configure_logging, get_logger
 from kg_mle.utils.paths import ensure_dir, ensure_parent_dir
@@ -65,6 +74,25 @@ def build(
         Path,
         typer.Option("--artifacts-dir", "-a", help="Directory for derived artifacts."),
     ] = DEFAULT_ARTIFACTS_DIR,
+    semantic_graph: Annotated[
+        bool,
+        typer.Option(
+            "--semantic-graph/--no-semantic-graph",
+            help="Enable optional Mem0 semantic graph expansion.",
+        ),
+    ] = False,
+    semantic_backend: Annotated[
+        str,
+        typer.Option("--semantic-backend", help="Semantic backend: local or mem0."),
+    ] = DEFAULT_SEMANTIC_BACKEND,
+    semantic_threshold: Annotated[
+        float,
+        typer.Option("--semantic-threshold", help="Minimum semantic edge score."),
+    ] = DEFAULT_SEMANTIC_THRESHOLD,
+    semantic_top_k: Annotated[
+        int,
+        typer.Option("--semantic-top-k", min=1, help="Semantic neighbors per endpoint."),
+    ] = DEFAULT_SEMANTIC_TOP_K,
 ) -> None:
     """Ingest ToolBench-style definitions and build derived artifacts."""
     ensure_dir(artifacts_dir)
@@ -72,9 +100,34 @@ def build(
     registry = load_registry(input_path)
     registry_path = artifacts_dir / DEFAULT_REGISTRY_PATH.name
     save_registry(registry, registry_path)
+    semantic_retriever = None
+    if semantic_graph:
+        if semantic_backend == "mem0":
+            semantic_retriever = Mem0SemanticRetriever(
+                embedding_provider=DEFAULT_EMBEDDING_PROVIDER,
+                embedding_model=DEFAULT_EMBEDDING_MODEL,
+                llm_provider=DEFAULT_MEM0_LLM_CONFIG.provider,
+                llm_model=DEFAULT_MEM0_LLM_CONFIG.model,
+                llm_api_key=DEFAULT_MEM0_LLM_CONFIG.api_key,
+                llm_base_url=DEFAULT_MEM0_LLM_CONFIG.base_url,
+            )
+        elif semantic_backend == "local":
+            semantic_retriever = SentenceTransformerSemanticRetriever(model_name=DEFAULT_EMBEDDING_MODEL)
+        else:
+            raise typer.BadParameter("semantic backend must be one of: local, mem0")
+    graph = build_tool_graph(
+        registry,
+        semantic_retriever=semantic_retriever,
+        semantic_threshold=semantic_threshold,
+        semantic_top_k=semantic_top_k,
+    )
+    graph_path = artifacts_dir / DEFAULT_GRAPH_PATH.name
+    save_tool_graph(graph, graph_path)
     console.print(
-        "[green]built registry[/green]: "
-        f"tools={len(registry.tools)} endpoints={registry.endpoint_count()} path={registry_path}"
+        "[green]built artifacts[/green]: "
+        f"tools={len(registry.tools)} endpoints={registry.endpoint_count()} "
+        f"nodes={graph.node_count()} edges={graph.edge_count()} "
+        f"registry={registry_path} graph={graph_path}"
     )
 
 

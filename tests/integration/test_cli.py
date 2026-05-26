@@ -23,7 +23,7 @@ def test_cli_version():
     assert __version__ in result.output
 
 
-def test_build_command_writes_registry(tmp_path):
+def test_build_command_writes_registry_and_graph(tmp_path):
     result = runner.invoke(
         app,
         [
@@ -36,8 +36,9 @@ def test_build_command_writes_registry(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert "built registry" in result.output
+    assert "built artifacts" in result.output
     assert (tmp_path / "registry.json").exists()
+    assert (tmp_path / "tool_graph.json").exists()
 
 
 def test_generate_command_exposes_steering_toggle():
@@ -48,4 +49,3 @@ def test_generate_command_exposes_steering_toggle():
 
     assert result.exit_code == 0
     assert "cross_conversation_steering=False" in result.output
-
