@@ -1,2743 +1,982 @@
 # DESIGN
 
-## 1. Executive Summary
+Offline synthetic-data pipeline that turns ToolBench-style API definitions into
+multi-turn, multi-tool conversations with grounded tool traces. The document
+is organised around the rubric: system design first, then each component,
+then context/diversity/prompts/judge/repair/tests. Honest tradeoffs and
+known gaps are called out in each section rather than buried.
 
-This project builds an offline synthetic data generation pipeline for multi-turn, multi-tool conversations grounded in ToolBench-style API definitions.
+## 1. Overview
 
-The submitted workflow is intentionally scoped as a production-oriented MVP:
-
-- It uses a curated, reproducible ToolBench-style subset instead of the full ToolBench corpus.
-- It implements the required architecture as real package modules and CLI commands.
-- It keeps the default pipeline deterministic and runnable without private credentials.
-- It supports optional semantic graph expansion using local embeddings and a Mem0 adapter.
-
-Current pipeline:
+**Pipeline:**
 
 ```text
-ToolBench-style JSON
--> normalized registry
--> tool graph
--> sampler
--> offline executor
--> conversation generator
--> evaluator / repair loop
--> JSONL dataset
+ToolBench JSON
+  └─► load_registry + enrich   ──► artifacts/registry.json
+        └─► build_tool_graph    ──► artifacts/tool_graph.json
+              └─► ToolChainSampler ──► SamplingResult
+                    └─► CorpusPlanner ──► list[SamplingResult] (steering on/off)
+                          └─► ConversationCoordinator
+                                ├─► Planner / User / Assistant  (deterministic or LLM)
+                                └─► OfflineExecutor (per-conversation session)
+                                      └─► Conversation (JSONL line)
+                                            └─► evaluate (deterministic + optional LLM judge)
+                                                  └─► optional repair pass
+                                                        └─► scored JSONL + metrics
 ```
 
-Implemented so far:
+**CLI** (`src/kg_mle/cli.py`): `build`, `generate`, `evaluate`, `diversity`,
+plus a global `--use-llm` switch that activates hosted-LLM features
+(registry enrichment, judge, repair planner, generator agents).
+
+**Scope.** Curated 9-domain, 45-endpoint ToolBench-style fixture
+(`data/sample_toolbench/tools.json`) with intentional schema messiness:
+lowercase methods, `path` vs `url`, mixed parameter-list keys, missing
+types, three response-schema shapes (JSON Schema, flat map, field list).
+The loader handles the full mess; the rest of the pipeline runs offline
+by default, with all LLM features behind opt-in flags.
+
+**Key result (steering on, seed 42, 100 conversations):**
+
+| | Run A (no steering) | Run B (steering) |
+|---|---:|---:|
+| endpoint coverage | 78% | 89% |
+| tool coverage | 89% | 100% |
+| domain entropy | 2.53 | 2.70 |
+| top-endpoint share | 22% | 19% |
+| mean deterministic score | 9.96 | 10.00 |
+| usable-for-training rate | 99% | 100% |
+
+Steering widens coverage without hurting quality. Full breakdown in §10.
+
+**Test status:** 178 tests pass without credentials (`pytest -m "not live"`);
+five `@pytest.mark.live` tests run when API keys are present and skip
+cleanly otherwise.
+
+## 2. Architecture and Communication
+
+### Components
+
+| Module | Responsibility | Boundary |
+|---|---|---|
+| `registry/` | Tolerant ToolBench JSON → normalized Pydantic `ToolRegistry`. Deterministic field enrichment + optional LLM enrichment. | Reads raw JSON; writes `registry.json`. |
+| `graph/` | Builds typed `ToolGraph` from registry. `output_satisfies_input` grounding edges via alias-aware matching. Optional semantic expansion (local SentenceTransformer or Mem0). | Reads `ToolRegistry`; writes `tool_graph.json`. |
+| `sampler/` | `ToolChainSampler` does deterministic DFS with backtracking. `CorpusPlanner` distributes constraints across a corpus. `CorpusSteerer`/`NullSteerer` are the on/off variants. | Reads `ToolGraph`; emits `SamplingResult`s. |
+| `executor/` | `OfflineExecutor` opens per-conversation `ExecutorSession`. Validates args (Pydantic + strict grounding). Generates chain-consistent mock responses. | Driven turn-by-turn by the coordinator. |
+| `generator/` | Three stateless agents (`Planner`, `UserSimulator`, `Assistant`), each in deterministic and LLM variants behind the same Protocol. `ConversationCoordinator` owns the transcript. | Reads `SamplingResult`; writes `Conversation`. |
+| `evaluation/` | Deterministic metrics + optional `LLMJudge` (5 rubric dimensions). | Reads JSONL; writes metrics + scored JSONL. |
+| `repair/` | `RepairPolicy` detects triggers; deterministic or LLM planner proposes a `RepairPlan`; safe local repairs are applied. | Reads scored conversation; mutates a copy. |
+| `diversity/` | Runs the steering on/off experiment, computes metrics, writes report. | Wraps generator + evaluator. |
+| `schema/` | Pydantic artifact schemas for downstream filters. | Reusable by tests + downstream. |
+| `llm/` | `StructuredLLMClient` — provider-neutral JSON client (Gemini default, Groq backup, OpenAI-compatible, HF). | Used by enricher, judge, repair, generator. |
+
+### Communication flow inside one conversation
 
 ```text
-ToolBench-style JSON
--> normalized registry
--> deterministic + optional semantic tool graph
+coordinator.run(sampling_result, seed)
+  │ 1. planner.plan(sampling_result, seed)            → Plan        [Pydantic-validated]
+  │ 2. executor.open_session(sampling_result, seed)   → ExecutorSession
+  │ 3. user.initial_request(plan, seed)               → UserTurn    → append to transcript
+  │
+  │ loop until terminal:
+  │ 4. assistant.compose_turn(plan, transcript, session, ...) → AssistantTurn [Pydantic]
+  │    branch on kind:
+  │      clarification → append assistant Q, call user.reply_to_clarification, append A
+  │      tool_calls    → for each proposal: session.call(endpoint_id, args)
+  │                      on ExecutorError → record inline → retry once via assistant
+  │      final_summary → append closing → exit loop
+  │    if chain_deviation present: gate by confidence + endpoint exists + graph supports it
+  │
+  │ 5. return Conversation(messages, plan, metadata)
 ```
 
-## 2. ToolBench Interpretation
+Every cross-component boundary is a typed Pydantic object. No free-text
+transcript parsing. Generator-supplied args go through the same executor
+validator as `suggest_arguments`-derived ones — no privileged caller.
 
-ToolBench provides raw API/tool definitions: categories, tool names, endpoint names, parameters, descriptions, HTTP methods, paths, and sometimes response schemas.
+### Load-bearing system-level decisions
 
-In this project, ToolBench-style definitions are used as the source of truth for what tools exist. We are not reusing ToolBench conversations as generated output. The generated conversations will be synthetic.
+| Decision | Why |
+|---|---|
+| **Deterministic-first, LLM opt-in throughout.** Every component has a deterministic path that satisfies the rubric; LLM features are toggles. | CI runs offline. Reviewers without credentials get a working pipeline. LLM features become realism boosters, not crash points. |
+| **Provider-neutral LLM client** (Gemini default, Groq backup, OpenAI-compatible, HF). | An earlier HF-only path hit a provider billing wall mid-test. One client lets `.env` swap providers without touching agent code. |
+| **Pydantic at every boundary** (registry, graph artifact, sampler result, executor errors, agent turns, judge scores, repair plans, dataset records). | One validation system; no schema drift between in-memory and on-disk; the assignment's structured-output requirement is satisfied by construction. |
+| **Per-chain RNG seed derived as `planner_seed*1_000_003 + plan_index`**, not threaded through a single RNG. | Steering on/off must not perturb each chain's individual RNG state — otherwise Run A and Run B aren't directly comparable at the per-chain level. |
+| **JSON-serializable graph, not Neo4j**; in-memory state, not a vector DB (Mem0 is opt-in). | Reviewer setup is `pip install`. The graph artifact is grep-able. |
+| **Strict grounding everywhere, errors inline in conversation log.** | The rubric's "coherent chaining" property is enforced at execution, not by the prompt. Failures surface as `role: "tool"` error entries so reviewers see the repair flow inline. |
 
-Design decision:
+### What I'm uncertain about at the system level
 
-- Use ToolBench-style API definitions as schema grounding.
-- Generate new conversations and traces from those definitions.
+- **Per-chain seed scheme uses modular arithmetic on `2**31 − 1`.** Two
+  distant chain indices could collide on the same per-chain seed by
+  accident. With 100-chain corpora this hasn't happened; at 100k chains
+  the collision probability becomes non-negligible. A 64-bit seed space
+  would be cheap to switch to and I haven't.
+- **`endpoint_id` is `domain/name`.** Loud-fails on duplicates within a
+  domain (already tested), but the full ToolBench corpus would force a
+  rename pass. The honest path forward is `domain/tool_name/name` and a
+  migration; I didn't take it because the curated fixture has no
+  collisions.
 
-Reason:
+## 3. Tool Registry
 
-- The assignment asks for synthetic conversation generation grounded in ToolBench schemas, not for replaying existing ToolBench data.
+`src/kg_mle/registry/` — Pydantic models, tolerant loader, optional
+enrichment.
 
-## 3. Scope And Dataset Fixture
+**Models:** `ToolRegistry → Tool → Endpoint → Parameter / ResponseField`.
+Unknown parameter types default to `string`; missing methods default to
+`GET`; missing descriptions get templated from the field name.
 
-The fixture at `data/sample_toolbench/tools.json` contains:
-
-- 9 categories: Finance, Sports, AI / ML, Entertainment, Travel, Gaming, Events, Food, Weather.
-- 45 total endpoints.
-- Intentional inconsistencies that mimic raw ToolBench schema issues.
-
-Examples of intentional messiness:
-
-- lowercase HTTP methods
-- missing methods
-- `path` instead of `url`
-- `response` instead of `response_schema`
-- null or empty response schemas
-- `required` instead of `required_parameters`
-- `optional_params` and `optionalParameters`
-- missing or unknown parameter types
-
-Design decision:
-
-- Use a curated representative subset for the submitted run.
-- Keep the loader generic enough for broader ToolBench-style JSON.
-
-Alternative considered:
-
-- Process the full ToolBench corpus immediately.
-
-Reason rejected:
-
-- The exercise is time-boxed. A curated subset gives reproducible review behavior while still exercising registry normalization, graph construction, semantic search, sampling, execution, evaluation, and repair.
-
-## 4. Packaging And CLI
-
-The project uses:
-
-- `pyproject.toml`
-- `hatchling` for packaging
-- `typer` for CLI
-- `rich` for logs and command output
-- `pydantic` for typed internal models
-
-CLI surface:
+**Response-schema shapes handled.** The fixture mixes them on purpose:
 
 ```text
-kgmle build
-kgmle generate
-kgmle evaluate
+JSON Schema:    {"type":"object","properties":{"hotel_id":{"type":"string"}}}
+flat field map: {"hotel_id":"string","name":"string"}
+field list:     [{"name":"hotel_id","type":"string"}, ...]
+missing/null/empty: → no fields
 ```
 
-Current implemented command:
+A flat map is distinguished from a JSON-Schema shell by whether the
+keys are schema keywords (`type`, `properties`, `items`, `oneOf`, ...).
+This heuristic could mis-identify a flat map whose key happens to be one
+of those words; in the fixture this hasn't occurred.
+
+**`endpoint_id` format** is `domain/name`. Duplicates within a domain
+raise `ValueError` at load time naming both colliding tools. Chose
+human-readable short IDs with a loud-fail safety net over
+`domain/tool/name` because the curated subset has no collisions.
+
+**Field enrichment** adds `canonical_name`, `aliases`, and confidences
+to parameters and response fields:
 
 ```text
-kgmle build
+deterministic aliases (destination→city, venue→location,
+                       available_time→start_time, check_in→date)
++ optional structured-output LLM suggestions via StructuredLLMRegistryEnricher
 ```
 
-It writes:
+Guardrails: `canonical_name` must be in a whitelist; confidence ∈ [0,1];
+suggestions below threshold or for missing fields are rejected; original
+field names are never removed (they remain the actual call arguments).
+This is what the graph's grounding logic reads — see §4.
+
+| Decision | Alternative | Why |
+|---|---|---|
+| Tolerant normalization (preserve incomplete endpoints) | Strict validation that rejects | ToolBench data is inconsistent; rejecting kills coverage. |
+| Pydantic types throughout | Pass raw dicts downstream | Centralising parsing keeps every later module simpler. |
+| LLM enrichment is structured-output + whitelist | Free-text LLM output | A bad LLM canonical name would silently miswire the graph. |
+
+### Honest gaps
+
+- The flat-map vs JSON-Schema heuristic is name-based. A schema with a
+  field literally named `"type"` would be misread. None in the fixture.
+- The canonical-name whitelist was hand-maintained for the fixture; it
+  has 36 entries. Scaling to full ToolBench would need either a vetted
+  vocabulary or an LLM-curated one with human review.
+
+## 4. Tool Graph
+
+`src/kg_mle/graph/` — JSON-serializable typed graph.
+
+**Node types:** `domain`, `tool`, `endpoint`, `parameter`, `response_field`.
+**Edge types:** `contains_tool`, `exposes_endpoint`, `requires_parameter`,
+`returns_field`, `output_satisfies_input` (grounding), `same_domain`,
+`semantic_related`.
+
+**Grounding logic.** A response field satisfies a parameter when their
+identifier sets overlap. An identifier set is
+`{name, canonical_name (if set), *aliases}`, so the matcher reads
+enrichment metadata directly off the registry models — not a hardcoded
+table. Each grounding edge records `match_type`
+(`exact_name`, `canonical`, `alias`) so the sampler can prefer stronger
+matches.
+
+Earlier iterations used a `COMMON_PARAMETER_NAMES` blocklist plus a
+local `FIELD_ALIASES` dict. Both decisions broke the design:
+
+- The blocklist excluded `city`, `start_time`, `query`, etc., killing
+  the cross-domain chains the assignment explicitly wants.
+- The local alias dict bypassed enrichment, leaving enrichment metadata
+  unread. Enrichment was decorative.
+
+Removing both unlocked 7 cross-domain grounding edges in the fixture,
+including `food/check_availability.available_time → events.start_time`
+which works only because deterministic enrichment maps
+`available_time → start_time`.
+
+**Semantic expansion** is opt-in (`--semantic-graph`). The retriever
+indexes endpoint cards (description + inputs + outputs) and adds
+`semantic_related` edges for pairs above a threshold. Two backends behind
+one `SemanticRetriever` Protocol:
 
 ```text
-artifacts/registry.json
-artifacts/tool_graph.json
+SentenceTransformerSemanticRetriever  (local MiniLM)  ← default
+Mem0SemanticRetriever                 (HF embeddings + Gemini LLM + in-memory Qdrant)
 ```
 
-Design decision:
+**Threshold choice.** Default 0.78. Sweep at 0.72/0.76/0.80/0.84
+produced 117/74/24/6 edges respectively before deterministic-duplicate
+filtering. After filtering: 0.78 yields 4 meaningful cross-domain
+semantic links. Lower admitted too much noise; higher was too sparse.
+This is tuned to the specific MiniLM model — a different embedding
+model would need re-tuning.
 
-- Build an installable package with a real console command instead of loose scripts.
+| Decision | Alternative | Why |
+|---|---|---|
+| JSON artifact, not Neo4j | External graph DB | Sampler only needs adjacency; reviewers shouldn't run services. |
+| `output_satisfies_input` is the strongest edge | Treat all edge types equally during sampling | Direct support for "coherent chaining" rubric property. |
+| Semantic edges are opt-in, never override deterministic edges | Always-on semantic expansion | Cosine similarity ≠ proof that output satisfies input. |
 
-Reason:
-
-- The assignment will be reviewed end-to-end. A package and CLI make the workflow easier to run, test, and inspect.
-
-Alternative considered:
-
-- Plain scripts and `argparse`.
-
-Reason rejected:
-
-- That would be simpler initially but weaker as a production-style submission.
-
-## 5. Configuration And Secrets
-
-Default paths and model settings live in `src/kg_mle/config.py`.
-
-The project loads local `.env` values through `python-dotenv`.
-
-Important files:
+**Current verification** (deterministic, no semantic):
 
 ```text
-.env.example   committed template only
-.env           local secrets/config, ignored by git
+nodes 274 │ edges 474 │ output_satisfies_input 29 │ same_domain 180
 ```
 
-Current model defaults:
+With local MiniLM semantic at 0.78: +4 `semantic_related` edges.
+
+### Honest gaps
+
+- The `same_domain` edge count (180) is dense — basically a fully-connected
+  per-domain clique. The walker treats them as fallback only. At scale,
+  this would need pruning to "likely sequences," but the fixture is small
+  enough that the noise is tolerable.
+- Mem0's ANN is non-deterministic in principle. We default to local MiniLM
+  (deterministic given a fixed model). Mem0 is exercised by a live test
+  but isn't the reproducibility backbone.
+
+## 5. Tool-Chain Sampler
+
+`src/kg_mle/sampler/` — graph-driven sampler + corpus planner + steering.
+
+### Walker (`walker.py`)
+
+Deterministic DFS with backtracking over endpoint-to-endpoint edges,
+filtered and ordered into tiers (grounded → same_domain → semantic). The
+seeded RNG shuffles within each tier; ties break on target endpoint_id.
+
+**`ChainConstraints` interface:**
 
 ```text
-KG_MLE_LLM_PROVIDER=gemini
-KG_MLE_LLM_MODEL=gemini-2.0-flash-lite-001
-KG_MLE_SEMANTIC_BACKEND=local
-KG_MLE_EMBEDDING_PROVIDER=huggingface
-KG_MLE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-KG_MLE_SEMANTIC_THRESHOLD=0.78
-KG_MLE_SEMANTIC_TOP_K=5
+n_steps                  int | (min, max)
+min_distinct_tools       int
+min_distinct_domains     int
+required_domains         tuple[str, ...]
+required_endpoint        str | None
+min_grounded_transitions int        # the "coherent chaining" knob
+allow_semantic_edges     bool
+forbid_endpoint_ids      tuple[str, ...]    # steering hook
 ```
 
-Design decision:
+The assignment's two named cases ("at least one tool from a given
+domain", "exactly N steps") are `required_domains` and `n_steps`.
+Varied length is `n_steps=(min, max)`. Coherent chaining is
+`min_grounded_transitions`. Steering hooks are `forbid_endpoint_ids`
+and a recommended `required_domains[0]` from the steerer.
 
-- Keep secrets out of git.
-- Use `.env.example` only as documentation.
-- Use deterministic fallbacks so reviewers do not need private keys.
+| Decision | Alternative | Why |
+|---|---|---|
+| DFS + backtracking | Bidirectional BFS / shortest path | Every chain in the search space is interesting; constraints are checked at terminal, not en route. |
+| Tiered edge preference | Single edge pool with terminal filter | Biases search toward groundable chains by construction. |
+| Per-tier seeded shuffle, deterministic tie-break | Pure deterministic ordering | Pure determinism → same chain every seed, defeats sampling. |
+| Terminal-only constraint check (with grounded-feasibility prune) | Full branch-and-bound | Marginal speedup at fixture scale; readability wins. |
 
-Alternative considered:
-
-- Require API keys for all generation/evaluation.
-
-Reason rejected:
-
-- Reviewer environments may not have credentials. The required workflow should still run offline.
-
-### Hosted LLM Provider Choice
-
-The default hosted LLM provider is Gemini, with Groq as the preferred
-backup for open-model inference.
-
-Design decision:
-
-- Use Gemini for optional generation and judge calls.
-- Keep Groq behind the same structured JSON client as an OpenAI-compatible
-  backup.
-- Keep Hugging Face as an optional adapter, not the default path.
-
-Reason:
-
-- Gemini has a practical free-tier path for API testing and supports
-  JSON-shaped generation well enough for structured-output prompts.
-- Groq gives a second hosted path for open models without downloading
-  weights locally.
-- Hugging Face Inference Providers are useful, but the Qwen live test hit
-  provider billing limits, so HF is too volatile to be the default reviewer
-  path.
-
-Implementation:
+**Fixture observation.** Probe over 50 seeds:
 
 ```text
-src/kg_mle/llm/clients.py
+fully-grounded 2-step:  50/50 seeds succeed
+fully-grounded 3-step:  50/50 seeds succeed
+fully-grounded 4-step:   0/50 seeds succeed
 ```
 
-`StructuredLLMClient` supports:
-
-- Gemini REST `generateContent` with `responseMimeType=application/json`
-- Groq `/openai/v1/chat/completions` with `response_format=json_object`
-- other OpenAI-compatible providers through `KG_MLE_LLM_BASE_URL`
-- Hugging Face as a retained fallback adapter
-
-The generator agents depend only on `complete_json(...)`, so switching
-providers does not change planner/user/assistant logic.
-
-## 6. Tool Registry
-
-The registry is the normalized source of truth for tools and endpoints.
-
-Raw input:
-
-```text
-data/sample_toolbench/tools.json
-```
-
-Normalized output:
-
-```text
-artifacts/registry.json
-```
-
-Core models:
-
-- `ToolRegistry`
-- `Tool`
-- `Endpoint`
-- `Parameter`
-- `ResponseField`
-
-The registry normalizes:
-
-- category/domain names
-- endpoint names
-- HTTP methods
-- paths
-- required and optional parameters
-- parameter types
-- response fields
-
-Unknown or missing parameter types default to `string`.
-
-Design decision:
-
-- Normalize tolerantly and preserve endpoints whenever possible.
-
-Alternative considered:
-
-- Strict validation that rejects incomplete endpoints.
-
-Reason rejected:
-
-- ToolBench-style data is inconsistent. Rejecting incomplete endpoints would reduce coverage and make the pipeline brittle.
-
-Alternative considered:
-
-- Use raw JSON dictionaries directly in graph, sampler, and executor.
-
-Reason rejected:
-
-- Every downstream module would need repeated defensive parsing. Centralizing normalization keeps later components simpler and easier to test.
-
-### Response Schema Shapes
-
-ToolBench-style data uses several response-schema shapes inconsistently. The
-loader handles four:
-
-```text
-JSON Schema:        {"type": "object", "properties": {"hotel_id": {"type": "string"}}}
-flat field map:     {"hotel_id": "string", "name": "string"}
-list of field dicts:[{"name": "hotel_id", "type": "string"}, ...]
-missing/null/empty: -> empty list (no fields)
-```
-
-A flat map is distinguished from a JSON-Schema shell by checking whether the
-keys look like JSON-Schema keywords (`type`, `properties`, `items`, `oneOf`,
-etc.). If they do not, the dict is treated as a flat field map.
-
-### Endpoint ID Uniqueness
-
-`endpoint_id` is formatted as `domain/name`. If two tools in the same domain
-expose endpoints with the same name, the loader raises `ValueError` with both
-tool names. This prevents silent dict-keyed overwrites in downstream consumers.
-
-If you scale to full ToolBench data and hit a collision, either rename the
-colliding endpoints in the input or extend the ID format to include
-`tool_name`. The choice was made deliberately to keep `endpoint_id` short and
-human-readable in the curated subset, with a loud-fail safety net.
-
-### Removed: `raw_schema` Field
-
-Earlier iterations stored `raw_schema: dict[str, Any]` on every `Endpoint` and
-persisted it to `artifacts/registry.json`. It roughly doubled artifact size
-(~145 KB → ~97 KB after removal) and risked downstream code accidentally
-reading raw, unnormalized fields. It is removed. Debugging tools that need the
-raw payload should re-read the source JSON.
-
-### Registry Field Enrichment
-
-The registry also supports a constrained enrichment layer for canonical names, aliases, and type hints.
-
-Default behavior:
-
-```text
-deterministic normalization
--> deterministic alias enrichment
--> optional structured LLM-style suggestions
-```
-
-Deterministic examples:
-
-```text
-destination -> city
-venue -> location
-available_time -> start_time
-check_in -> date
-```
-
-The enrichment layer stores metadata on parameters and response fields:
-
-```text
-canonical_name
-aliases
-type_confidence
-alias_confidence
-enrichment_source
-```
-
-Design decision:
-
-- Do not let enrichment rename or delete original fields.
-- Preserve original schema names and add canonical metadata.
-
-Reason:
-
-- Original parameter names are needed for actual tool-call arguments.
-- Canonical metadata helps the graph and sampler reason across near-equivalent fields without losing traceability.
-
-Optional LLM-style suggestions are represented as structured Pydantic objects:
-
-```text
-FieldEnrichmentSuggestion
-├── endpoint_id
-├── target: parameter | response_field
-├── field_name
-├── canonical_name
-├── aliases
-├── type_hint
-├── confidence
-├── reason
-└── source
-```
-
-Guardrails:
-
-- suggestions must validate through Pydantic
-- `canonical_name` must be in the allowed canonical vocabulary
-- `type_hint` must be one of the internal registry types
-- confidence must be between 0 and 1
-- suggestions below threshold are rejected
-- suggestions for missing fields are rejected
-- original field names are never removed
-- deterministic normalization remains the fallback
-
-Design decision:
-
-- Use LLM-style structured enrichment only for unresolved alias/type cases, not as the primary registry normalizer.
-
-Reason:
-
-- The registry is the base contract for graph construction. Keeping deterministic normalization first preserves reproducibility, while structured enrichment demonstrates LLM-oriented schema repair capability in a controlled way.
-
-Future path:
-
-- Wire `FieldEnrichmentSuggestion` to an actual provider-backed structured-output LLM call.
-- Cache accepted enrichment suggestions into artifacts for reproducibility.
-- Compare deterministic-only vs enriched graph quality in the diversity experiment.
-
-Implementation status:
-
-- The structured suggestion schema, validation, confidence gating, and application logic are implemented.
-- A Hugging Face registry enricher is implemented behind `--llm-enrich-registry`.
-- Local live test with `KG_MLE_LLM_MODEL=google/gemma-4-E2B-it` reached Hugging Face, but the HF router reported that the configured model is not available as a chat model and has no text-generation provider mapping.
-- Live test with `KG_MLE_LLM_MODEL=Qwen/Qwen2.5-3B-Instruct` and `KG_MLE_HF_PROVIDER=featherless-ai` successfully reached a provider-backed conversational endpoint and returned JSON-shaped suggestions, proving the integration path works. A full run was stopped by provider billing/credit limits (`402 Payment Required`), so live LLM enrichment remains explicit opt-in.
-- A `@pytest.mark.live` integration test (`tests/integration/test_hf_enricher_live.py`) now exercises the enricher against 2 endpoints when `HF_TOKEN` is present and the provider is reachable. It asserts the report is well-formed (whitelisted `canonical_name`, valid confidence, field application reflects the suggestion) but does not assert specific suggestions — LLM output is non-deterministic by design.
-- Therefore live Gemma enrichment is not enabled by default. The deterministic and fake structured-enrichment paths remain fully tested.
-- To use live registry enrichment, configure a Hugging Face-hosted instruction model that supports the Inference API/router, or configure a future local provider such as Ollama, LM Studio, vLLM, or LiteLLM for Gemma.
-
-## 7. Tool Graph
-
-The graph is a typed, JSON-serializable artifact.
-
-Output:
-
-```text
-artifacts/tool_graph.json
-```
-
-Core models:
-
-- `GraphNode`
-- `GraphEdge`
-- `ToolGraph`
-
-Node types:
-
-- `domain`
-- `tool`
-- `endpoint`
-- `parameter`
-- `response_field`
-
-Edge types:
-
-- `contains_tool`
-- `exposes_endpoint`
-- `requires_parameter`
-- `returns_field`
-- `output_satisfies_input`
-- `same_domain`
-- `bridge`
-- `semantic_related`
-
-Design decision:
-
-- Use a JSON-serializable graph instead of Neo4j.
-
-Reason:
-
-- The current graph is small enough for memory.
-- Reviewers do not need to run an external graph database.
-- JSON artifacts are easy to inspect.
-- The sampler only needs adjacency-style traversal.
-
-Alternative considered:
-
-- Neo4j or another graph database.
-
-Reason rejected:
-
-- Adds service setup, deployment overhead, slower tests, and operational complexity that does not improve the submitted MVP.
-
-Future path:
-
-- The typed graph artifact can be exported to Neo4j later if full ToolBench scale needs indexed graph traversal or interactive graph analysis.
-
-## 8. Deterministic Graph Edges
-
-The graph builder always creates deterministic edges.
-
-Structural edges:
-
-```text
-domain -> tool
-tool -> endpoint
-endpoint -> parameter
-endpoint -> response_field
-```
-
-Grounding edges:
-
-```text
-source endpoint returns X
-target endpoint requires X
-=> output_satisfies_input
-```
-
-Example:
-
-```text
-travel/search_hotels returns hotel_id
-travel/get_hotel_details requires hotel_id
-travel/book_itinerary requires hotel_id
-```
-
-Derived edges:
-
-```text
-travel/search_hotels -> travel/get_hotel_details
-travel/search_hotels -> travel/book_itinerary
-```
-
-Design decision:
-
-- Treat `output_satisfies_input` as the strongest edge type.
-
-Reason:
-
-- It directly supports grounded tool chaining and reduces hallucinated arguments.
-
-### Alias-Aware Field Matching
-
-A response field satisfies a parameter when their identifier sets overlap. An
-identifier set is `{name, canonical_name (if set), *aliases}`. This means the
-matcher reads enrichment metadata directly off `Parameter` and `ResponseField`
-rather than from a hardcoded local alias table.
-
-Each grounding edge records the match strength in metadata:
-
-```text
-exact_name: parameter.name == field.name
-canonical:  match via canonical_name on either side
-alias:      match via an alias entry only
-```
-
-The sampler can later prefer `exact_name` edges over `alias` edges when
-weighting chain candidates.
-
-### What Changed And Why
-
-An earlier iteration of `_field_satisfies_parameter` used a module-level
-`COMMON_PARAMETER_NAMES` blocklist and a module-level `FIELD_ALIASES` dict.
-Both decisions hurt the graph:
-
-- The blocklist excluded `city`, `date`, `location`, `start_time`, `query`,
-  and other common fields. This made cross-domain chains like
-  `weather/get_forecast(city)` ungroundable from any other endpoint that
-  returned a `city` field, even though that is exactly the cross-domain
-  chaining the assignment requires.
-- The hardcoded alias dict bypassed the structured enrichment layer. The
-  enrichment work set `canonical_name = "city"` on `destination` parameters
-  but the matcher never read it; only the local table did. Enrichment was
-  effectively decorative.
-
-Removing the blocklist and routing matching through enrichment metadata
-unlocked 7 new cross-domain grounding edges in the fixture, including one
-(`food/check_availability.available_time -> events.start_time`) that is only
-possible because deterministic enrichment recognises `available_time` as a
-canonical alias of `start_time`. The same alias has been in the codebase
-since enrichment landed but was unused by the graph until now.
-
-The risk of false-positive matches (e.g., every endpoint returning `city`
-chaining into every endpoint that consumes `city`) is real but is a
-*sampler* concern, not a graph-construction concern. The graph should expose
-the truth; the sampler can downweight low-information matches using the
-`match_type` metadata recorded on each edge.
-
-## 9. Semantic Graph Expansion
-
-The graph builder supports optional semantic expansion.
-
-Current command:
-
-```powershell
-kgmle build --semantic-graph --semantic-backend local
-```
-
-The semantic retriever indexes endpoint cards:
-
-```text
-Endpoint: travel/search_hotels
-Domain: travel
-Description: Find hotels in a city.
-Inputs: city, check_in, max_price
-Outputs: hotel_id, hotel_name, nightly_price
-```
-
-The builder then adds `semantic_related` edges for high-scoring endpoint pairs.
-
-Design decision:
-
-- Use semantic expansion as optional candidate discovery, not as the grounding backbone.
-
-Reason:
-
-- Semantic similarity can suggest realistic adjacent tools, but it does not prove that one tool's output satisfies another tool's input.
-
-## 10. Mem0, Local Embeddings, And Model Choices
-
-The assignment mentions mem0 as an option for vector-backed retrieval. The code includes a `Mem0SemanticRetriever` behind the same interface as the local retriever.
-
-Local test finding:
-
-- `mem0ai==2.0.2` successfully installed.
-- `Memory.from_config(...)` exists.
-- Mem0 initialized the Hugging Face embedder successfully.
-- Mem0 then initialized an LLM even though the graph builder only needed semantic search.
-- Without explicit LLM config, Mem0 defaulted to OpenAI and failed without `OPENAI_API_KEY`.
-- The Mem0 adapter now passes explicit Gemini config when `GOOGLE_API_KEY` is available.
-- The adapter uses `infer=False` when adding endpoint cards to Mem0, because endpoint cards are already structured and do not need LLM-based memory extraction.
-- The adapter uses Mem0 search filters instead of deprecated top-level entity parameters.
-- The adapter configures Qdrant for MiniLM's 384-dimensional embeddings.
-
-Final Mem0 verification:
-
-```text
-kgmle build --semantic-graph --semantic-backend mem0
-```
-
-With `HF_TOKEN`, `GOOGLE_API_KEY`, and Gemini config present in `.env`, Mem0 successfully built the graph:
-
-```text
-nodes: 274
-edges: 472
-semantic_related: 4
-```
-
-The accepted Mem0 semantic edges matched the local MiniLM backend:
-
-```text
-sports/get_schedule -> gaming/get_tournament_schedule
-gaming/get_tournament_schedule -> sports/get_schedule
-travel/book_itinerary -> events/book_tickets
-events/book_tickets -> travel/book_itinerary
-```
-
-Conclusion:
-
-- Mem0 is supported as an optional backend, but it is not the safest default for an offline review environment unless LLM credentials are configured.
-- A Hugging Face token alone is not sufficient for Mem0 2.0.2's memory pipeline because Mem0 also expects an LLM provider.
-- Gemini is the preferred Mem0 LLM provider for this project because Google AI Studio has accessible free-tier usage.
-
-Default semantic backend:
-
-```text
-SentenceTransformerSemanticRetriever
-model: sentence-transformers/all-MiniLM-L6-v2
-```
-
-Optional Mem0 LLM config:
-
-```text
-KG_MLE_MEM0_LLM_PROVIDER=gemini
-KG_MLE_MEM0_LLM_MODEL=gemini-2.0-flash-lite-001
-GOOGLE_API_KEY=<local secret>
-```
-
-### Why `infer=False` For Mem0 Endpoint Cards
-
-Mem0 is designed for user/conversation memory. In that default mode, `infer=True` lets an LLM extract cleaner memories from free-form text.
-
-Example where LLM inference is useful:
-
-```text
-Raw: "I usually book vegetarian-friendly restaurants near my hotel."
-Inferred memory: "User prefers vegetarian-friendly restaurants near their hotel."
-```
-
-Our graph-building input is different. Endpoint cards are already structured:
-
-```text
-Endpoint: travel/search_hotels
-Domain: travel
-Description: Find hotels in a city.
-Inputs: city, check_in, max_price
-Outputs: hotel_id, hotel_name, nightly_price
-```
-
-Letting an LLM rewrite these cards would add cost, latency, and nondeterminism without improving the schema facts. It could also accidentally omit parameter names or response fields that are important for graph construction.
-
-Therefore the Mem0 adapter uses:
-
-```text
-infer=False
-```
-
-This means:
-
-- store the endpoint card as-is
-- create embeddings
-- make it searchable
-- do not ask an LLM to extract or rewrite the memory
-
-This is the correct behavior for deterministic schema graph construction.
-
-### Mem0 Test Coverage
-
-The `Mem0SemanticRetriever` constructor accepts an injected `memory` object
-so its behavior can be tested without a live Mem0 install or provider
-credentials. Unit tests cover:
-
-- indexing always calls `Memory.add(..., infer=False)` with the correct
-  `user_id` and `endpoint_id` metadata
-- search-result parsing prefers `metadata.endpoint_id`, falls back to looking
-  up the previously-indexed text, and skips results that cannot be resolved
-- `search.filters` uses `{"user_id": "kg_mle_tool_graph"}`, not the
-  deprecated top-level entity parameters
-- results are capped at the requested `top_k`
-
-The real Mem0 path (with Hugging Face embeddings, Gemini LLM, and an
-in-memory Qdrant store) is now covered by a live integration test
-(`tests/integration/test_mem0_live.py`) that runs when `HF_TOKEN` and
-`GOOGLE_API_KEY` are present and skips otherwise. It asserts the
-index/search contract — not specific semantic matches, because ANN is
-approximate. The injected-memory unit tests remain the credential-free
-safety net for the result-parsing contract.
-
-## 10.1 LLM Provider Orchestration
-
-The project separates LLM provider configuration from business logic.
-
-Provider config is loaded through:
-
-```text
-src/kg_mle/llm/providers.py
-```
-
-Supported provider patterns:
-
-```text
-gemini      -> GOOGLE_API_KEY
-openai      -> OPENAI_API_KEY
-anthropic   -> ANTHROPIC_API_KEY
-deepseek    -> DEEPSEEK_API_KEY
-qwen        -> DASHSCOPE_API_KEY
-together    -> TOGETHER_API_KEY
-huggingface -> HF_TOKEN
-ollama      -> KG_MLE_LLM_BASE_URL
-lmstudio    -> KG_MLE_LLM_BASE_URL
-vllm        -> KG_MLE_LLM_BASE_URL
-```
-
-Design decision:
-
-- Use a lightweight provider configuration layer instead of hardcoding one vendor.
-
-Reason:
-
-- The assignment should be runnable by reviewers with different available credentials.
-- It lets the future generator, judge, and repair loop swap between Gemini, OpenAI, Claude, DeepSeek, Qwen, Gemma via local runtimes, or deterministic fallbacks.
-- It avoids coupling the core pipeline to a single API vendor.
-
-Gemma 4 note:
-
-- Gemma 4 remains the preferred open model family for future generation/judging.
-- For Mem0 specifically, Gemma 4 can be used through local/provider-compatible routes such as Ollama, LM Studio, vLLM, Together, or LiteLLM if configured.
-- MiniLM remains the embedding model because embeddings and instruction generation are different tasks.
-
-Why MiniLM:
-
-- free
-- CPU-friendly
-- small
-- widely used for sentence similarity
-- works well for endpoint-card retrieval
-
-LLM model policy:
-
-```text
-Preferred future generation/judge model: google/gemma-4-E2B-it
-Embedding model: sentence-transformers/all-MiniLM-L6-v2
-```
-
-Design decision:
-
-- Use Gemma 4 as the preferred future instruction model.
-- Use MiniLM for embeddings.
-
-Reason:
-
-- Generation/judging and embedding are different tasks. Gemma is appropriate for instruction generation; MiniLM is appropriate for lightweight vector similarity.
-
-## 11. Reducing Hallucination And Nondeterminism
-
-Hallucination controls already designed:
-
-- normalize schemas before graph construction
-- use exact output-to-input edges for grounded chains
-- preserve response fields and required parameters
-- later executor will maintain per-conversation state for returned IDs
-- later validator will reject ungrounded arguments
-
-Semantic nondeterminism controls:
-
-- semantic graph expansion is optional
-- deterministic graph edges always exist
-- tests use `FakeSemanticRetriever`
-- semantic matches are sorted by score descending, then endpoint ID
-- self-edges are removed
-- semantic edges are not added when a deterministic source-target pair already exists
-- thresholds and `top_k` are fixed and stored in metadata
-- accepted semantic edges are persisted into `tool_graph.json`
-
-Threshold experiment with local MiniLM before deterministic duplicate filtering:
-
-```text
-threshold 0.72 -> 117 semantic edges
-threshold 0.76 -> 74 semantic edges
-threshold 0.80 -> 24 semantic edges
-threshold 0.84 -> 6 semantic edges
-```
-
-After excluding source-target pairs already covered by deterministic graph construction:
-
-```text
-threshold 0.76 -> 9 semantic edges
-threshold 0.78 -> 4 semantic edges
-threshold 0.80 -> 2 semantic edges
-```
-
-Chosen default:
-
-```text
-KG_MLE_SEMANTIC_THRESHOLD=0.78
-```
-
-Reason:
-
-- `0.76` admitted more borderline matches.
-- `0.80` was too sparse.
-- `0.78` preserved a small number of meaningful cross-domain semantic links.
-
-## 12. Current Graph Verification
-
-Deterministic graph:
-
-```text
-nodes: 274
-edges: 474
-
-node types:
-domain: 9
-tool: 9
-endpoint: 45
-parameter: 101
-response_field: 110
-
-edge types:
-contains_tool: 9
-exposes_endpoint: 45
-requires_parameter: 101
-returns_field: 110
-output_satisfies_input: 29
-same_domain: 180
-```
-
-`output_satisfies_input` match-type breakdown:
-
-```text
-exact_name: 28
-canonical:  1   (food/check_availability.available_time -> events.start_time)
-```
-
-Cross-domain grounding edges (the cases that hardcoded blocklists previously suppressed):
-
-```text
-sports/get_player_stats          -> gaming/recommend_games        (player_id)
-entertainment/search_live_shows  -> events/create_calendar_event  (start_time)
-gaming/search_games              -> sports/get_game_odds          (game_id)
-gaming/search_games              -> events/create_calendar_event  (title)
-gaming/get_tournament_schedule   -> events/create_calendar_event  (start_time)
-food/check_availability          -> events/create_calendar_event  (available_time -> start_time, canonical)
-weather/recommend_outdoor_window -> events/create_calendar_event  (start_time)
-```
-
-Semantic graph with local MiniLM at threshold `0.78`:
-
-```text
-nodes: 274
-edges: 478
-semantic_related: 4
-```
-
-Accepted semantic edges:
-
-```text
-sports/get_schedule -> gaming/get_tournament_schedule
-gaming/get_tournament_schedule -> sports/get_schedule
-travel/book_itinerary -> events/book_tickets
-events/book_tickets -> travel/book_itinerary
-```
-
-## 13. Testing Strategy
-
-Tests are organized by purpose:
-
-```text
-tests/fixtures/
-tests/unit/
-tests/integration/
-tests/e2e/
-```
-
-Current coverage:
-
-- fixture validity and intentional messiness
-- path/config helpers
-- `.env` config override behavior
-- CLI smoke behavior
-- registry normalization (clean, messy, flat-dict responses, list-shaped responses, JSON-Schema shells)
-- registry persistence
-- registry enrichment (deterministic, structured-output suggestions, Hugging Face enricher with mocked client)
-- duplicate `endpoint_id` rejection
-- graph model validation
-- graph builder construction
-- grounding edge creation, including alias-driven grounding produced by enrichment
-- cross-domain grounding via common fields (`city`, `start_time`, etc.)
-- semantic edge filtering
-- local semantic retriever behavior through a mocked model
-- Mem0 retriever indexing and search-result parsing via an injected fake `Memory`
-
-Current result:
-
-```text
-51 passed
-```
-
-### Live Integration Tests
-
-Two `@pytest.mark.live` tests in `tests/integration/` exercise the real
-external paths when credentials are present and skip cleanly otherwise:
-
-- `test_mem0_live.py` — indexes 4 endpoint cards through real Mem0 (HF
-  embeddings, Gemini LLM, in-memory Qdrant) and asserts the search results
-  are drawn from the indexed set, scored, and sorted descending. It does
-  not assert specific semantic matches because ANN + model drift would
-  make that flaky.
-- `test_hf_enricher_live.py` — runs the HF registry enricher against 2
-  endpoints (capped via `max_llm_endpoints`) and asserts the report is
-  well-formed: every accepted suggestion has a whitelisted
-  `canonical_name`, a confidence in `[0, 1]`, and is reflected on the
-  actual field. It does not assert that any specific field gets enriched.
-
-Both tests skip — not fail — on missing credentials, provider rejection
-(402 billing, model unavailable), or transient outages. The intent is
-to catch *protocol regressions* (Mem0 result-shape change, HF API
-shape change, JSON-extraction parser drift) without flaking CI on
-provider availability.
-
-Design decision:
-
-- Add tests immediately after each component.
-
-Reason:
-
-- The assignment explicitly requires unit, integration, and end-to-end tests. Keeping tests close to each implementation step prevents a late testing scramble.
-
-## 13.5 Tool-Chain Sampler (Walker)
-
-The sampler walks the tool graph to produce candidate chains. It is
-graph-driven (the assignment's hard requirement) and constraint-driven
-(the assignment's constrained-sampling requirement).
-
-```text
-src/kg_mle/sampler/
-├── constraints.py    # ChainConstraints, SamplingResult, Transition
-├── walker.py         # ToolChainSampler — DFS with backtracking
-├── steering.py       # CorpusSteerer, NullSteerer, CorpusCounters
-└── plan.py           # CorpusPlanner — orchestrates a corpus
-```
-
-### How the Sampler Works (Short Version)
-
-1. The walker is built once from a `ToolGraph`. It indexes every
-   `output_satisfies_input`, `same_domain`, and `semantic_related` edge
-   into a per-endpoint adjacency list; structural edges
-   (`contains_tool`, `exposes_endpoint`, etc.) are ignored because they
-   describe graph anatomy, not chain advancement.
-2. A `ChainConstraints` object names what the caller wants: chain length,
-   required domains, minimum grounded transitions, etc.
-3. The walker chooses a start endpoint (deterministic from the seed,
-   biased toward `required_domains` / `required_endpoint`).
-4. From the start, it does depth-first search with backtracking. At each
-   step it lists outgoing edges, filters by `allow_semantic_edges`,
-   sorts them into tiers (grounded → same_domain → semantic), shuffles
-   within each tier using the seeded RNG, and tries each in order.
-5. When the chain reaches the target length, a terminal check enforces
-   `min_distinct_tools`, `min_distinct_domains`, `required_domains`,
-   `min_grounded_transitions`, and `required_endpoint`. If any fail, the
-   walker backtracks and tries another candidate.
-6. If no chain in the search space satisfies the constraints, it raises
-   `UnsatisfiableConstraintsError` with diagnostics — never a
-   hallucinated chain.
-
-### Design Decisions
-
-**Design decision:** Use a graph-walking sampler with DFS and
-backtracking, not goal-directed path search.
-
-**Alternative considered:** Bidirectional BFS from a start node toward a
-constraint-satisfying terminal endpoint.
-
-**Reason rejected:** BFS would optimise for shortest path; here every
-chain in the search space is interesting, and constraint satisfaction
-is checked at the terminal, not en route. DFS with backtracking
-explores the same search space with simpler code and matches the
-"propose a chain that satisfies constraints" framing — not "find the
-shortest chain that does."
-
----
-
-**Design decision:** Tiered edge preference — grounded > same_domain >
-semantic — rather than a single edge pool.
-
-**Alternative considered:** Treat all edge types as equivalent and
-filter by constraint at the terminal check only.
-
-**Reason rejected:** The assignment's "coherent chaining" property
-rewards chains where step N is grounded in step N−1 outputs. Treating
-grounded and same_domain edges as equivalent during the walk made it
-significantly more likely that backtracking would explore unproductive
-same_domain or semantic paths before stumbling into a grounded one.
-Tiered ordering biases the search toward groundable chains by
-construction.
-
----
-
-**Design decision:** `semantic_related` edges are opt-in via
-`allow_semantic_edges=True`, not on by default.
-
-**Alternative considered:** Include `semantic_related` edges in the
-default search space, weighted lower than `same_domain`.
-
-**Reason rejected:** Semantic edges are loosely justified (cosine
-similarity, not a structural relationship). They are useful for
-expanding the *candidate* set of related endpoints but are not strong
-evidence that one tool's output satisfies another's input. The walker
-should expose them only when the caller explicitly asks; otherwise
-the judge's "tool correctness" score would suffer.
-
----
-
-**Design decision:** Per-tier seeded shuffle with `(target endpoint_id)`
-tie-breaks.
-
-**Alternative considered:** Pure deterministic ordering (sort by edge
-source/target ids only) with no shuffle.
-
-**Reason rejected:** Pure determinism would produce the same chain for
-every seed, defeating the purpose of seeded sampling and making
-multi-chain corpora repetitive. Tie-breaking on endpoint_id within the
-shuffled tier keeps single-seed runs reproducible even if the graph's
-edge ordering changes between builds (Pydantic dump order is stable,
-but we don't want to depend on that).
-
----
-
-**Design decision:** Terminal-only constraint check (length match,
-distinct counts, required domains, grounded transitions).
-
-**Alternative considered:** Branch-and-bound — prune partial chains
-that can't satisfy constraints from here.
-
-**Reason rejected:** We *do* prune the obvious infeasibility (e.g., if
-`min_grounded_transitions` needs more grounded edges than the remaining
-steps can supply, the walker rejects non-grounded candidates
-immediately). But full branch-and-bound on distinct-tools /
-distinct-domains would complicate the code for marginal speedup at the
-fixture size we're working with (45 endpoints, chain length ≤ 5).
-Terminal-only checks keep the walker readable.
-
-### Determinism Guarantee
-
-Same seed + same constraints + same graph = same chain. The seeded
-`random.Random` instance threads through every shuffle (start ordering,
-candidate ordering within each tier). Tests cover this explicitly.
-
-### Fixture Grounding-Density Limit
-
-A 50-seed probe revealed:
-
-```text
-fully-grounded 2-step chains: 50/50 seeds succeed
-fully-grounded 3-step chains: 50/50 seeds succeed
-fully-grounded 4-step chains:  0/50 seeds succeed
-```
-
-The 29 grounding edges in the curated fixture don't chain densely
-enough to produce a fully-grounded 4-step path. This is a fixture
-observation, not a walker limitation. The planner targets
+The 29 grounding edges don't chain densely enough for 4 consecutive
+grounded transitions. The planner therefore targets
 `min_grounded_transitions = n_steps − 2` for 4+ step chains — one
-same_domain fallback per chain is acceptable. The grounded transitions
-remain the ones the executor uses for chain-consistent ID mocking;
-same_domain transitions get argument-from-user-intent synthesis.
+same-domain hop per chain is acceptable. The walker correctly raises
+`UnsatisfiableConstraintsError` rather than hallucinating.
 
-## 13.6 Corpus Planner and Cross-Conversation Steering
+### Corpus Planner (`plan.py`) and Steering (`steering.py`)
 
-The planner is the layer between the dataset properties the assignment
-calls out (50–60% multi-step, varied lengths, balanced domain coverage,
-coherent chaining) and the walker's per-chain constraint API. It owns
-the corpus-level loop, the steering counters, and the relaxation
-strategy that protects against unsatisfiable constraints.
-
-### How the Planner Works (Short Version)
-
-1. For each chain in `range(target_count)`, the planner builds a fresh
-   `ChainConstraints` instance derived from:
-   - a length distribution skewed toward 3–4 steps,
-   - a `multi_step_fraction` (default 0.55) that bumps
-     `min_distinct_tools` to 2 when applicable,
-   - `min_grounded_transitions = n_steps − 2` (or stricter for short
-     chains),
-   - the steerer's recommendations: least-used domain as
-     `required_domains[0]`, currently-overused endpoints as
-     `forbid_endpoint_ids`.
-2. It calls the walker with a per-chain seed derived deterministically
-   from the planner seed plus the chain index.
-3. On `UnsatisfiableConstraintsError`, the planner runs through a fixed
-   relaxation ladder (loosen grounded → clear required_domains → loosen
-   distinct_domains → clear forbid list → loosen distinct_tools →
-   loosen n_steps), retrying up to `max_relaxation_attempts` times.
-4. The steerer records every successful chain — domains, tools,
-   endpoints, transitions, length, domain pattern — and exposes the
-   summary via `report.counters_summary`.
-5. `--no-cross-conversation-steering` swaps `CorpusSteerer` for
-   `NullSteerer`. `NullSteerer` still records counters (so Run A and
-   Run B have comparable stats) but returns empty forbid lists and
-   alphabetical-only domain hints. The planner's main loop is
-   unchanged.
-
-### Design Decisions
-
-**Design decision:** Hybrid steering — hard exclusion (`forbid_endpoint_ids`)
-plus soft preference (`least_used_domains` biasing
-`required_domains`).
-
-**Alternative considered:** Probability-based reweighting — full
-softmax over endpoint usage counts.
-
-**Reason rejected:** Probability reweighting would require the walker
-to support weighted sampling, which it doesn't, or for the planner to
-intercept and rewrite the walker's edge ordering. Both bleed steering
-concerns into the walker. Hard exclusion plus required-domain bias
-uses only the constraints the walker already exposes — clean
-separation of layers.
-
----
-
-**Design decision:** Threshold for hard exclusion has a hard floor of 3,
-plus a per-corpus baseline of `target_count / endpoint_count * 1.6`.
-
-**Alternative considered:** Pure baseline-based threshold,
-no floor.
-
-**Reason rejected:** Without the floor, small corpora
-(`target_count < endpoint_count`) hit a threshold of 1 or 2 — any
-endpoint used at all gets forbidden after a few chains, and the
-planner runs out of usable endpoints within a dozen samples. The floor
-of 3 lets every endpoint get a few uses before steering kicks in, so
-the diversity gain doesn't come at the cost of generation throughput.
-
----
-
-**Design decision:** `NullSteerer` still records counters even though it
-returns no penalties.
-
-**Alternative considered:** When steering is off, don't track counters
-at all.
-
-**Reason rejected:** The diversity experiment requires Run A and Run B
-to be directly comparable on the same metrics. Without counters in
-Run A, "did steering increase endpoint coverage?" can't be answered
-quantitatively. The cost of always recording is one Counter increment
-per result — negligible.
-
----
-
-**Design decision:** Per-chain seeds derived as
-`(planner_seed * 1_000_003 + plan_index) % (2**31 − 1)`.
-
-**Alternative considered:** Thread a single RNG through the entire
-corpus loop.
-
-**Reason rejected:** A single RNG means turning steering on/off changes
-the RNG state for every subsequent chain (because steering-driven
-constraint shaping consumes a different number of RNG draws). That
-makes Run A and Run B harder to compare — the *same* chain index would
-draw a different walker seed. Per-chain seeds keep each chain's RNG
-state stable across the steering flag.
-
----
-
-**Design decision:** Relaxation ladder rather than abandoning chains
-that fail.
-
-**Alternative considered:** On `UnsatisfiableConstraintsError`, just
-record the failure and move on.
-
-**Reason rejected:** Steering's whole point is to widen coverage by
-forbidding overused endpoints. As the forbid list grows, constraint
-sets get harder to satisfy. Without relaxation, the planner would
-silently drop chains in the back half of long runs — exactly when
-diversity matters most. The relaxation ladder gives up steering for
-one chain rather than losing the chain entirely; the steerer still
-records what was sampled.
-
-### Empirical Diversity Contrast
-
-Smoke run with `target_count=100`, `seed=42`, same fixture:
+For each chain `0..N`, `CorpusPlanner` builds a fresh `ChainConstraints`
+from: a length distribution skewed to 3–4 steps, a `multi_step_fraction`
+(default 0.55) that lifts `min_distinct_tools` to 2,
+`min_grounded_transitions = n_steps − 2`, plus the steerer's hints. On
+`UnsatisfiableConstraintsError`, a fixed relaxation ladder fires:
 
 ```text
-                              Run A (no steering)   Run B (steering)
-distinct endpoints used       35 / 45               40 / 45
-distinct domains              8                     9
-top-endpoint share            76%                   65%
-multi-step + multi-tool       81%                   81%
-chains generated              100                   100
-relaxation fallbacks          0                     0
+loosen min_grounded_transitions
+  → clear required_domains
+  → loosen min_distinct_domains
+  → clear forbid_endpoint_ids     ← gives up on steering, not the chain
+  → loosen min_distinct_tools
+  → loosen n_steps
 ```
 
-Steering widens endpoint coverage by 5 endpoints and one domain, and
-reduces top-endpoint concentration by 11 percentage points, with no
-loss in multi-step coverage. These are the seeds for the formal
-diversity metrics computed in §15 (TBD).
+`--no-cross-conversation-steering` swaps `CorpusSteerer` for
+`NullSteerer`. Both record counters (so Run A vs Run B are directly
+comparable on the same metrics); only the steerer returns forbid lists
+and least-used domain hints. The hard-exclusion threshold has a floor
+of 3 so small corpora don't run out of usable endpoints.
 
-## 13.7 Offline Tool Execution Model
+| Decision | Alternative | Why |
+|---|---|---|
+| Hybrid steering: hard exclusion + soft domain preference | Probability-based softmax reweighting | Uses only constraints the walker already exposes; clean layer separation. |
+| Per-chain seed `planner_seed*1_000_003 + plan_index` | Thread a single RNG | Steering on/off must not shift each chain's individual RNG state. |
+| `NullSteerer` still records counters | Skip counters when steering off | Run A vs Run B needs comparable stats on both sides. |
+| Relaxation ladder gives up steering before the chain | Drop unsatisfiable chains | Steering is meant to widen coverage, not lose conversations. |
 
-The executor is the layer that turns a sampled chain into a realised
-sequence of (tool_call, tool_response) pairs without invoking real APIs.
-It is the assignment §3 requirement, and it is also the within-conversation
-grounding implementation called out in §5.1.
+### Honest gaps
+
+- Steering's threshold formula (`max(3, ceil(target/endpoint_count * 1.6))`)
+  was tuned by trial and error on the fixture. No formal study of the
+  diversity/throughput tradeoff at other corpus sizes.
+- Endpoint-pair overuse is recorded but the walker doesn't directly forbid
+  pairs — only individual endpoints. Pair-level steering is future work.
+- The relaxation ladder is fixed-order, not learned. A chain that fails
+  with `(required_domains, min_grounded=2)` might have succeeded under
+  `(no required_domains, min_grounded=2)` faster than the ladder's order
+  reaches it.
+
+## 6. Offline Tool Execution
+
+`src/kg_mle/executor/` — stateful per-conversation session.
 
 ```text
-src/kg_mle/executor/
-├── state.py       # SessionState, LogEntry — per-conversation memory
-├── mocks.py       # MockResponseGenerator + canonical example pools
-├── validator.py   # Pydantic-shaped + grounded-arg validation, typed errors
-└── session.py     # ExecutorSession, OfflineExecutor — what the generator drives
+state.py      SessionState (issued-values index, chronological log)
+mocks.py      MockResponseGenerator + canonical example pools + ID prefixes
+validator.py  Pydantic dynamic model + strict grounding check + typed errors
+session.py    ExecutorSession.call / suggest_arguments / example_values
 ```
 
-### How It Works (Short Version)
+### How a tool call works
 
-1. `OfflineExecutor` is constructed once per pipeline run; it holds the
-   registry handle.
-2. For each conversation, the generator calls `open_session(sampling_result, seed=...)`.
-   That returns a fresh `ExecutorSession` whose `SessionState` starts
-   empty.
-3. On every tool call:
-   - the session records the call in the conversation log,
-   - validates arguments via a dynamic Pydantic model + a strict grounding
-     check that compares each grounded parameter to the session's
-     issued-values index,
-   - on failure, records a `tool_error` entry in the log and raises a
-     typed exception (the repair loop reads both),
-   - on success, generates a schema-consistent mock response, registers
-     every string-valued response field into the issued-values index
-     (under literal *and* canonical name), and records the response in
-     the log.
-4. The generator can preview-and-shape calls via:
-   - `suggest_arguments(endpoint_id)` — plausible defaults derived from
-     session state for grounded params and a canonical example pool for
-     free params;
-   - `example_values(endpoint_id)` — few-shot pool the generator can
-     show the LLM: real issued IDs for grounded params, canonical
-     example pool for free params.
+```text
+session.call(endpoint_id, arguments)
+  ├─► record call in state.log
+  ├─► validate:
+  │     • dynamic Pydantic model for type + required-presence
+  │     • strict grounding: every grounded parameter's value must appear in
+  │       state.issued_ids(source_field) — under literal OR canonical name
+  ├─► on ExecutorError: append role:"tool" {error:{...}} log entry, raise
+  └─► on success: generate mock (schema-consistent + chain-consistent),
+        register every string response field into issued-values, return dict
+```
 
-### Design Decisions
+Mocks are deterministic from a session seed. IDs get prefixed hashes
+(`htl_a3f9`, `bk_b8c2`, `evt_d7e1`); fields with known canonical names
+(city, date, symbol, ...) draw from realistic-value pools; everything
+else falls back to typed templates.
 
-**Design decision:** Mocks are deterministic-by-default; an LLM polish
-pass is opt-in only.
+### Strict grounding applies to all grounded parameters
 
-**Alternative considered:** LLM-generated responses by default,
-deterministic only as a fallback.
+Not just `*_id` fields. `finance/search_symbol → finance/get_quote` is
+grounded via `symbol` — if the assistant invents a symbol that
+`search_symbol` never returned, the chain is incoherent and the
+validator rejects it. Indexing under both literal and canonical name
+handles the enriched-alias case.
 
-**Reason rejected:** Every response field that the next call grounds
-into must be byte-stable for the conversation to be reproducible from
-a seed. LLM responses are non-deterministic in temperature ≥ 0 and
-costly across hundreds of calls. Deterministic mocks for the chain
-critical path plus optional LLM polish for descriptive fields (planned
-flag `--llm-mock-polish`) keeps the offline pipeline functional without
-credentials while preserving the upgrade path.
-
----
-
-**Design decision:** The executor is a *stateful session* the generator
-drives one tool call at a time.
-
-**Alternative considered:** A batch `run_chain(sampling_result)` that
-executes the entire chain at once and returns a list of
-(call, response) pairs.
-
-**Reason rejected:** The multi-agent generator needs to interleave
-clarifying questions, user replies, and tool calls. With a batch
-runner, the executor would have to know about non-tool turns or be
-called repeatedly with growing chain prefixes — both ugly. A stateful
-session matches the conversation's actual control flow.
-
----
-
-**Design decision:** Argument *synthesis* lives in the executor
-(`suggest_arguments`, `example_values`); argument *override* is the
-generator's prerogative.
-
-**Alternative considered:** Argument synthesis is the generator's job;
-the executor only validates and mocks.
-
-**Reason rejected:** The executor already owns the schema, the
-canonical example pool, and the issued-values index — three of the
-four inputs needed to pick a plausible default. Making the generator
-re-derive defaults would duplicate this knowledge across modules.
-Instead, the executor exposes `suggest_arguments` as the easy-path API
-and `example_values` as a few-shot pool the generator can render into
-the LLM prompt. Generator overrides go through the same validator, so
-there is no privileged caller and no trust gap.
-
----
-
-**Design decision:** Failures raise typed exceptions *and* appear as
-`role: "tool"` entries in the conversation log. No "permissive mode"
-flag.
-
-**Alternative considered:** Toggle the executor between "raise on
-violation" and "return mock error payload" via a flag.
-
-**Reason rejected:** The repair loop needs control flow (catch on
-failure, retry with corrected args). A typed exception is the cleanest
-control-flow signal. The log entry is what gives the reviewer
-visibility — a flag would have made one of those two needs hard to
-satisfy. Surfacing both at once means the conversation trace tells the
-full story of what went wrong, in the same stream the assistant's good
-calls live in.
-
----
-
-**Design decision:** Strict grounding applies to all grounded
-parameters, not just ID-shaped ones.
-
-**Alternative considered:** Only enforce grounding on `*_id`-shaped
-parameters; let other grounded params (city, symbol, date) pass through
-without a session-state check.
-
-**Reason rejected:** The sampler's grounded transitions describe an
-output-to-input promise at the field-name level, not the ID level.
-`finance/search_symbol -> finance/get_quote` is grounded via `symbol`;
-if the assistant invented a symbol that `search_symbol` never returned,
-the chain is incoherent and the judge's "tool correctness" score
-should penalize it. Strict-everywhere keeps the executor honest about
-what "groundedness" means.
-
----
-
-**Design decision:** Session state registers every string-valued
-response field, not just IDs, keyed by both literal and canonical
-name.
-
-**Alternative considered:** Register only ID-shaped fields.
-
-**Reason rejected:** A direct consequence of the strict-grounding
-decision above. Non-ID grounded transitions (the `symbol` case) need
-the same lookup path as ID grounded transitions. Indexing under both
-literal and canonical name handles the case where the enrichment layer
-mapped the field to a canonical (`destination -> city`) and the next
-endpoint's required parameter is the canonical form.
-
-### Sample Trace (Conversation Log)
-
-A 3-step chain with a deliberate hallucinated grounded argument in step 2:
+### Sample trace with a deliberate hallucination
 
 ```json
-{"role": "assistant", "tool_calls": [{"endpoint": "travel/search_flights",
-   "arguments": {"origin": "...", "destination": "Paris", "date": "2026-04-11"}}]}
-{"role": "tool", "endpoint": "travel/search_flights",
-   "content": {"flight_id": "flt_lfxctn", "airline": "Airline 8", "price": "299.50"}}
-{"role": "assistant", "tool_calls": [{"endpoint": "travel/book_itinerary",
-   "arguments": {"flight_id": "made_up_value", "hotel_id": "...", "traveler_name": "..."}}]}
-{"role": "tool", "endpoint": "travel/book_itinerary",
-   "content": {"error": {"kind": "ungrounded_argument",
-                          "parameter": "flight_id",
-                          "expected_one_of": ["flt_lfxctn"]}}}
-{"role": "assistant", "tool_calls": [{"endpoint": "travel/book_itinerary",
-   "arguments": {"flight_id": "flt_lfxctn", "hotel_id": "...", "traveler_name": "..."}}]}
-{"role": "tool", "endpoint": "travel/book_itinerary",
-   "content": {"booking_id": "bk_bpcdp3", "status": "Status 16"}}
+{"role":"assistant","tool_calls":[{"endpoint":"travel/search_flights",
+   "arguments":{"origin":"...","destination":"Paris","date":"2026-04-11"}}]}
+{"role":"tool","content":{"flight_id":"flt_lfxctn","airline":"Airline 8","price":"299.50"}}
+{"role":"assistant","tool_calls":[{"endpoint":"travel/book_itinerary",
+   "arguments":{"flight_id":"made_up_value", ...}}]}
+{"role":"tool","content":{"error":{"kind":"ungrounded_argument",
+                                   "parameter":"flight_id",
+                                   "expected_one_of":["flt_lfxctn"]}}}
+{"role":"assistant","tool_calls":[{"endpoint":"travel/book_itinerary",
+   "arguments":{"flight_id":"flt_lfxctn", ...}}]}
+{"role":"tool","content":{"booking_id":"bk_bpcdp3","status":"confirmed"}}
 ```
 
-A reviewer can trace the rejection, the repair, and the recovery
-without consulting any external log.
+A reviewer sees the rejection, the repair, and the recovery without
+consulting an external log.
 
-## 13.8 Multi-Agent Conversation Generator
+| Decision | Alternative | Why |
+|---|---|---|
+| Deterministic mocks; LLM polish opt-in | LLM-generated responses by default | Chain-critical fields must be byte-stable for reproducibility. |
+| Stateful session, generator-driven | Batch `run_chain` | The generator interleaves clarifications and user replies between tool calls. |
+| Executor owns `suggest_arguments` + `example_values` | Generator re-derives defaults | The executor already owns schema + canonical pool + issued-values index. |
+| Failures raise typed errors AND appear inline as `role: tool` entries | Toggle between modes | One needs control flow; the other needs reviewer visibility. Both at once. |
+| Strict grounding on all grounded params, ID or not | Only enforce on `*_id` | Sampler's grounded transitions describe an output→input promise at the field-name level. |
 
-The generator turns one sampled chain into a role-tagged conversation
-matching the assignment's dataset record shape. Three stateless agents
-communicate through a typed Pydantic protocol; the coordinator owns
-the transcript and drives them in sequence.
+### Honest gaps
+
+- **Mock realism is bounded.** Unknown-canonical strings produce values
+  like `"Airline 8"` and `"Status 16"`. The judge's `naturalness`
+  dimension flags this. The planned `--llm-mock-polish` flag would help;
+  I haven't built it because the chain-critical path doesn't need it.
+- **Mid-conversation `modify_step` re-derives transitions from the graph,
+  but the new endpoint's required fields may not have been indexed by the
+  earlier steps.** The deviation handler runs a graph lookup and rejects
+  if no path exists, but it can't anticipate every grounding gap. Tested
+  for accept and reject paths but not for the edge case where a modify
+  succeeds graph-side but then fails at the executor's strict-grounding
+  check on the next call.
+
+## 7. Multi-Agent Generator
+
+`src/kg_mle/generator/` — three stateless agents + coordinator.
 
 ```text
-src/kg_mle/generator/
-├── protocol.py     # Pydantic models: Plan, AssistantTurn, UserTurn,
-│                   #   ChainDeviation, GeneratorConfig, Conversation
-├── agents.py       # Protocols + DeterministicPlanner / User / Assistant
-├── llm_agents.py   # StructuredLLMClient + LLMPlanner / User / Assistant
-│                   #   with retry + Pydantic + deterministic fallback
-└── coordinator.py  # ConversationCoordinator
+protocol.py      Plan, ParameterPlan, StepPlan, AssistantTurn, UserTurn,
+                 ToolCallProposal, ChainDeviation, Conversation, GeneratorConfig
+agents.py        Protocols + DeterministicPlanner / User / Assistant
+llm_agents.py    StructuredLLMClient + LLMPlanner / User / Assistant
+                 (retry + Pydantic + deterministic fallback)
+coordinator.py   ConversationCoordinator
 ```
 
-### How It Works (Short Version)
+### Agent contracts
 
-1. The coordinator receives a `SamplingResult` and a seed.
-2. It calls the planner once: `Planner.plan(...) -> Plan`. Plan is
-   Pydantic-validated, including per-parameter confidences and
-   ambiguous-step indices.
-3. It opens an `ExecutorSession` (from §13.7) for the conversation.
-4. It calls the user simulator to produce the initial request, appended
-   to the transcript.
-5. Main loop: at each turn it calls the assistant
-   (`Assistant.compose_turn(...) -> AssistantTurn`). Based on
-   `assistant_turn.kind`:
-   - **clarification** → append assistant question, call user to reply,
-     append user turn. Update the relevant `ParameterPlan` with the
-     supplied value.
-   - **tool_calls** → for each `ToolCallProposal`, append the
-     assistant's tool_call message, invoke `session.call(...)`, append
-     the resulting tool response (or, on `ExecutorError`, the error and
-     a single repair retry).
-   - **final_summary** → append the closing message and exit.
-6. Every turn additionally inspects `assistant_turn.chain_deviation`.
-   Accepted deviations rewire the `SamplingResult` in place; rejected
-   ones (low confidence / unknown endpoint / no graph path) are
-   recorded in metadata so the judge can see the proposal.
-7. The coordinator returns a `Conversation` Pydantic model carrying
-   `messages`, the validated `Plan`, and a metadata dict ready for the
-   dataset's JSONL line.
+```text
+Planner:    SamplingResult, seed                       → Plan
+              (intent, per-step ParameterPlan with confidence + ambiguous_step_indices)
+User:       initial_request(plan, seed)                → UserTurn
+            reply_to_clarification(plan, target_step,
+                                   target_param, seed) → UserTurn
+Assistant:  compose_turn(plan, transcript, session,
+                         steps_completed, ...)         → AssistantTurn
+              kind ∈ {clarification, tool_calls, final_summary}
+              tool_calls is list[ToolCallProposal] (length 1 today; list shape
+              future-proofs parallel calls without protocol changes)
+              optional ChainDeviation proposal
+```
 
-### Design Decisions
+### Disambiguation: planner-primary + confidence-gated assistant initiative
 
-**Design decision:** Three-agent decomposition — Planner, User, Assistant.
+The planner outputs per-parameter `confidence` and a list of
+`ambiguous_step_indices`. The assistant's default behaviour:
 
-**Alternative considered:** A four-agent decomposition with a separate
-Final-Writer agent producing the closing assistant message.
+1. If a current step is in `ambiguous_step_indices` and not yet
+   clarified → ask the planner-flagged question.
+2. Otherwise, if a free parameter has `confidence < 0.6` (configurable)
+   AND the assistant's own initiative confidence is high (configurable
+   `assistant_clarification_threshold`), the assistant asks its own
+   clarification.
+3. Otherwise, tool-call or final summary.
 
-**Reason rejected:** The closing summary is one short turn that
-naturally belongs to the same agent that emitted the tool calls; the
-plan and transcript carry enough context. Splitting it into a fourth
-agent adds an LLM hop with no quality gain.
+### Chain-bound termination + confidence-gated `ChainDeviation`
 
----
+The chain is the contract. The assistant may propose
+`ChainDeviation(kind="add_step" | "modify_step", endpoint_id, position, deviation_confidence)`.
+The coordinator accepts only if:
 
-**Design decision:** Structured output on *both* Planner and Assistant
-(the assignment requires ≥1; we use 2).
+- `deviation_confidence ≥ assistant_deviation_threshold` (default 0.85)
+- the endpoint exists in the registry
+- the graph supports the new transitions (prev→new and new→next must
+  have endpoint-to-endpoint edges; grounded preferred, same_domain
+  accepted)
 
-**Alternative considered:** Structured output only on the Assistant's
-tool calls; Planner emits free-text intent + a regex-parsed parameter
-list.
+Accepted deviations rewire the session's `sampling_result` in place;
+the session state preserves so earlier issued IDs remain valid.
+Rejected deviations are recorded in `metadata.deviations_rejected`
+with the reject reason — the judge can see what was attempted.
 
-**Reason rejected:** Free-text planning is brittle: a slightly
-different phrasing breaks the parser, and the ambiguity-injection
-behaviour (which drives planner-driven disambiguation) requires a
-structured `ambiguous_step_indices` list. Pydantic on both agents gives
-us validation, retry-with-error-context, and clean fallback semantics
-in one mechanism. Two structured-output agents is also stronger
-rubric evidence than one.
+### LLM agents wrap deterministic ones as fallback
 
----
+Each LLM agent has the same Protocol as its deterministic counterpart
+and falls back per-call on any failure (provider exception, malformed
+JSON, Pydantic validation error, plan/chain shape mismatch). The
+fallback records `last_run = {"path": "fallback", "reason": "..."}`,
+which the coordinator includes in metadata so the judge and the
+diversity experiment can see which conversations were LLM-driven.
 
-**Design decision:** Planner-primary disambiguation with confidence-gated
-assistant initiative.
-
-**Alternative considered:** Pure planner-driven (assistant never asks
-beyond the plan).
-
-**Reason rejected:** The planner can be wrong — especially in LLM mode
-where a parameter the planner thought was a canonical example might
-actually be ambiguous in context. The assistant gets the per-parameter
-`confidence` from the plan; when `confidence <
-planner_param_low_confidence` AND its own
-`assistant_clarification_confidence ≥
-assistant_clarification_threshold`, it asks an additional clarification.
-Both thresholds are configurable. The default behaviour is
-planner-driven; the gate makes assistant initiative possible but rare.
-
-Tested: `test_clarification_does_not_fire_when_ambiguity_zero` and the
-ambiguity-injection planner tests prove the planner-driven path; the
-gate logic is exercised through the deterministic assistant's branch
-2 in `compose_turn`.
-
----
-
-**Design decision:** Chain-bound termination with confidence-gated,
-graph-verified `ChainDeviation` proposals.
-
-**Alternative considered:** Assistant-decided termination — assistant
-can quit early or extend freely.
-
-**Reason rejected:** Free assistant termination would compete with the
-planner's length distribution targets (which hit the
-varied-conversation-length rubric requirement) and make Run A vs Run B
-diversity comparison muddier.
-
-The gate has three checks: (i) `deviation_confidence ≥
-assistant_deviation_threshold` (default 0.85); (ii) endpoint exists in
-the registry; (iii) the graph supports the new transitions — for
-`add_step`, `prev → new` AND `new → next` edges must exist (grounded
-preferred, same_domain accepted); for `modify_step`, both inbound and
-outbound transitions must be re-derivable. The session's
-`sampling_result` is updated in place when accepted; session state
-(issued IDs, log) is preserved. Tested across five coordinator tests
-covering both accepted and rejected variants.
-
-`modify_step` is moderate complexity — the implementation reuses the
-graph's existing edge-metadata to re-derive `Transition` objects, so
-the same data structure that drove sampling drives mid-conversation
-chain repair.
-
----
-
-**Design decision:** Deterministic agents by default; LLM agents are
-opt-in and *wrap* the deterministic agent as fallback.
-
-**Alternative considered:** LLM-required, fail loudly without credentials.
-
-**Reason rejected:** Same pattern as the executor's mocks and the
-semantic graph: CI must run offline. The deterministic agents produce
-structurally valid conversations that satisfy every hard rubric
-requirement (multi-turn disambiguation, valid tool calls, role
-tagging, coherent chaining). LLM agents add natural-language realism.
-A missing API key, a provider 402, or persistently-malformed LLM JSON
-all fall back transparently; the metadata records the path
-(`{"path": "llm", "retries": 0}` vs `{"path": "fallback",
-"reason": "..."}`) so the judge and the diversity experiment can read
-which conversations were LLM-driven.
-
----
-
-**Design decision:** Stateless agents, transcript owned by the
-coordinator, typed Pydantic handoff at every boundary.
-
-**Alternative considered:** Agents read the natural-language
-transcript directly and parse it for context.
-
-**Reason rejected:** Free-text transcript parsing makes one agent's
-prompt wording confuse another. Typed handoff means the planner emits
-a `Plan` object the assistant reads as a structured input — not as
-text. The transcript is only consulted by the assistant for tool-call
-history; clarification routing happens via `ClarificationTarget` on
-the assistant turn, not by inferring from natural language.
-
-### LLM Failure Modes and Where They Go
+### LLM failure modes
 
 | Failure | What happens |
 |---|---|
-| Provider 4xx/5xx / network exception | Immediate fallback to deterministic agent. `last_run.path="fallback"`, `reason` carries exception text. |
+| Provider 4xx/5xx / network exception | Immediate fallback to deterministic agent. |
 | Malformed JSON (no `{...}` found) | One retry with error context prepended. If still malformed → fallback. |
 | Schema mismatch (Pydantic `ValidationError`) | One retry with error context. If still invalid → fallback. |
 | Plan endpoint mismatch / wrong step count | One retry. If still wrong → fallback. |
-| Executor rejects an LLM-emitted tool call | One repair attempt invokes the assistant again with the failure in the transcript. If that fails → conversation closes; the failure is visible inline (per §13.7). |
+| Executor rejects an LLM-emitted tool call | One repair attempt invokes the assistant again with the failure in the transcript. If that fails → conversation closes with the failure visible inline. |
 
 The coordinator never crashes on LLM behaviour. The worst case is a
-deterministic conversation with metadata noting why the LLM path
-was abandoned.
+deterministic conversation with metadata noting why the LLM path was
+abandoned.
 
----
+| Decision | Alternative | Why |
+|---|---|---|
+| Three-agent decomposition (Planner / User / Assistant) | Four agents with a separate Final-Writer | The closing summary belongs to the same agent that emitted tool calls. |
+| Structured output on **both** Planner and Assistant | Just the Assistant | Planner's `ambiguous_step_indices` and per-param confidences need structured shape for the disambiguation gate to be deterministic. Two structured agents also doubles the rubric evidence. |
+| Planner-primary disambiguation + confidence-gated assistant initiative | Pure planner-driven | The planner can be wrong; the assistant gets per-param confidence and can ask when planner is unsure. |
+| Chain-bound termination + graph-verified `ChainDeviation` | Free assistant termination / extension | Free deviation would compete with the planner's length-distribution targets. The gates keep deviations exceptional. |
+| Deterministic agents by default; LLM agents wrap them as fallback | LLM-required | Missing API key, provider 402, persistently-malformed JSON → conversation still completes. |
+| Stateless agents; coordinator owns the transcript; typed Pydantic handoff | Agents read the natural-language transcript directly | Typed handoff prevents one agent's prompt wording from confusing another. |
 
-**Design decision:** Provider-neutral structured JSON client for LLM agents.
+### Honest gaps
 
-**Alternative considered:** Keep `llm_agents.py` directly tied to the
-Hugging Face `InferenceClient`.
+- The 3-step live LLM test was relaxed from "≥3 successful tool calls"
+  to "≥1" because the LLM path's completion rate is model-dependent and
+  flaky across providers. The deterministic coordinator tests are the
+  authoritative correctness signal; the live test is a protocol
+  regression catcher.
+- `ChainDeviation` accept paths are unit-tested with synthetic deviation
+  proposals; I haven't observed an LLM actually propose a confident
+  graph-valid deviation in live runs. The mechanism is in place, but its
+  real-world utility is unproven.
+- The deterministic user's clarification reply uses a fixed template
+  `"For X, use Y."`. The judge's `naturalness` score reflects this — it's
+  visibly synthetic. LLM user upgrades the wording; deterministic mode
+  doesn't.
 
-**Reason rejected:** The Qwen path through Hugging Face reached a live
-provider but hit billing/credit limits. That made the assignment's
-LLM path depend on a provider-specific payment wall rather than on the
-project's own design. The generator now uses `kg_mle.llm.StructuredLLMClient`,
-which supports Gemini as the default hosted path and Groq as a backup,
-while preserving HF as an optional adapter.
+## 8. Evaluation and LLM-as-Judge
 
-The provider adapter returns raw JSON text only. Pydantic validation,
-retry-with-error-context, confidence gates, and deterministic fallback
-remain in the agent layer. This keeps provider plumbing separate from
-generation policy.
+`src/kg_mle/evaluation/`
 
-### Live Integration Tests
-
-`tests/integration/test_llm_generator_live.py` runs the full
-LLM-driven pipeline against the configured Gemini, Groq, or Hugging Face
-provider when the matching API key is present:
-
-- `test_llm_generator_live_produces_structurally_valid_conversation`
-  — 2-step chain end-to-end, asserts role tags, ≥1 successful tool
-  call, all agents emit coherent `last_run` paths.
-- `test_llm_generator_live_runs_multi_step_chain_to_completion` —
-  3-step chain, asserts the LLM pipeline reaches the executor and
-  produces ≥1 successful tool call. Specific completion rates are
-  LLM-quality matters, not protocol regressions; the deterministic
-  coordinator tests already prove the coordinator drives a 3-step
-  chain to completion.
-
-Both skip without credentials. Both treat provider exceptions as
-"skip, not fail" — provider availability is volatile and CI's job is
-catching protocol regressions.
-
-## 14. Evaluation And LLM-As-Judge
-
-The evaluator has two layers:
+Two layers:
 
 ```text
-deterministic structural metrics
--> optional hosted LLM judge
--> JSON metrics artifact
+deterministic structural metrics    ← always runs, offline
+  + optional hosted LLM judge       ← --use-llm or --llm-judge
+  → JSON metrics + scored JSONL
 ```
 
-Command:
+**Commands:**
 
 ```powershell
-kgmle evaluate --input data/outputs/conversations.jsonl --output data/outputs/evaluation_metrics.json
-kgmle evaluate --llm-judge --max-llm-judge-records 10
+kgmle evaluate --input ... --output ...                  # deterministic only
+kgmle --use-llm evaluate --max-llm-judge-records 10      # adds LLM judge
+kgmle evaluate --repair --repair-threshold 8.0           # bounded repair pass
 ```
 
-The command writes two outputs:
+**Deterministic metrics** (no credentials needed):
 
 ```text
-evaluation_metrics.json       aggregate + per-record metrics
-evaluation_metrics_scored.jsonl
-                              original conversations with metadata.evaluation populated
+schema_valid              Pydantic Conversation round-trips
+role_sequence_valid       first message is user, all roles known
+tool_response_coverage    tool responses / assistant tool_calls
+chain_completion          successful responses / expected n_tool_calls
+error_free_trace          1 − (tool errors / tool messages)
+deterministic_score       mean of the above × 10
 ```
 
-Deterministic metrics are always available and do not require credentials:
+### LLM judge dimensions (0–10 each, plus issues + rationale)
 
-- schema validity through the `Conversation` Pydantic model
-- role sequence validity
-- assistant tool-call to tool-response coverage
-- chain completion against expected `metadata.n_tool_calls`
-- tool error rate
-- aggregate deterministic score
+| Dimension | What it measures |
+|---|---|
+| `task_completion` | Does the final assistant message satisfy the user's stated request? |
+| `tool_trace_validity` | Are tools selected, sequenced, and responded to coherently? |
+| `argument_grounding` | Do tool-call arguments come from user input, plan values, or prior tool outputs? |
+| `response_grounding` | Does the final answer stay faithful to actual tool outputs? |
+| `naturalness` | Does the dialogue read like a plausible human exchange? |
+| `overall_score` | Holistic — severe trace failures can dominate. |
+| `confidence` | Judge's own confidence in its score. |
 
-Score ranges:
+The dimensions intentionally separate **trace correctness**
+(`tool_trace_validity`, `argument_grounding`) from **answer quality**
+(`task_completion`, `response_grounding`, `naturalness`). A conversation
+can have natural wording but a bad tool trace, or a valid trace but a
+hallucinated final answer; both should be visible to filtering.
 
-- rubric scores use a 0-10 scale
-- `deterministic_score` and `mean_deterministic_score` use a 0-10 scale
-- LLM judge dimensions and `mean_llm_overall_score` use a 0-10 scale
-- coverage/rate fields such as `chain_completion`, `tool_response_coverage`,
-  and `schema_valid_rate` remain 0-1 ratios because they are fractions, not
-  rubric scores
+| Decision | Alternative | Why |
+|---|---|---|
+| Two-layer evaluation (deterministic always, LLM optional) | LLM-only | CI runs offline; deterministic metrics are reproducible. |
+| 5 rubric dimensions (>3 required) | Generic helpfulness/fluency | Generic metrics miss invalid tool calls that "sound natural." |
+| Separate `argument_grounding` and `response_grounding` | One "grounding" score | Different failure modes need different filters. |
+| 0–10 quality scores; 0–1 coverage ratios | One uniform scale | Quality is a human-readable rubric; coverage is a fraction. |
+| Treat provider failures as record-level `llm_judge.error`, not pipeline failures | Crash on first provider error | Hosted inference is optional; the deterministic eval shouldn't be blocked. |
 
-The optional LLM judge uses the same provider-neutral
-`StructuredLLMClient` as the generator. The default hosted path is Gemini;
-Groq can be used by switching `KG_MLE_LLM_PROVIDER=groq`.
-
-### Evaluation Design Principles
-
-The evaluator follows these design principles:
-
-- **Offline-first:** deterministic metrics run without credentials, network,
-  or a hosted model.
-- **Human-readable scale:** rubric scores are 0-10 because reviewers and
-  hiring panels can interpret them faster than 0-1 decimals.
-- **Separation of scores and rates:** quality scores are 0-10, while
-  mathematical coverage ratios remain 0-1.
-- **Structured judge output:** the LLM must return a Pydantic-validated JSON
-  object, not free-form prose.
-- **Visible-evidence judging:** the LLM judge is instructed to score only the
-  supplied conversation JSON and not infer real API behavior.
-- **Failure containment:** provider failures are stored in the record's
-  `llm_judge.error` field instead of crashing evaluation.
-- **Bounded cost:** `--max-llm-judge-records` limits how many records are sent
-  to the hosted judge.
-- **Single LLM switch:** `kgmle --use-llm ...` is the global opt-in for
-  optional hosted-model behavior. Individual legacy flags such as
-  `evaluate --llm-judge` remain supported for targeted runs, but new optional
-  LLM behavior should hang off the global switch.
-- **Provider portability:** the judge uses the same `StructuredLLMClient` as
-  generation, so Gemini, Groq, and OpenAI-compatible providers can be swapped
-  through `.env`.
-
-### Evaluation Design Decisions
-
-**Design decision:** Two-layer evaluation: deterministic metrics first,
-optional LLM-as-judge second.
-
-**Reason:** Deterministic metrics guarantee that every reviewer can run
-evaluation offline. The LLM judge adds qualitative signal when credentials
-are available, but it is not required for the pipeline to function.
-
----
-
-**Design decision:** Use dimensions tied to tool-use training quality rather
-than generic chatbot quality.
-
-**Reason:** Training data for tool-use agents must reward correct action
-traces, grounded arguments, and faithful final responses. Generic dimensions
-such as "helpfulness" or "fluency" would miss invalid tool calls that still
-sound natural.
-
----
-
-**Design decision:** Separate `argument_grounding` from
-`response_grounding`.
-
-**Reason:** These are different failure modes. A model can pass an invented
-ID into a tool even if the final answer sounds grounded, or it can call tools
-correctly and then hallucinate the final response. Keeping them separate
-makes filtering and repair more targeted.
-
----
-
-**Design decision:** Use a 0-10 scale for quality scores while leaving
-coverage metrics as 0-1 ratios.
-
-**Reason:** 0-10 is easier for humans to read in review artifacts. Coverage
-metrics such as `chain_completion` are mathematical fractions, so converting
-them to 0-10 would make them less precise and less conventional.
-
----
-
-**Design decision:** Store scores in both evaluation artifacts and scored
-conversation metadata.
-
-**Reason:** Aggregate metrics are useful for comparing runs, but downstream
-training/filtering needs per-conversation scores colocated with the
-conversation record. The raw generated JSONL is preserved; `kgmle evaluate`
-writes a separate scored JSONL.
-
----
-
-**Design decision:** Treat hosted-provider failures as record-level judge
-errors, not pipeline failures.
-
-**Reason:** Gemini/Groq/HF quotas and availability are external to the
-project. A provider error should not invalidate deterministic evaluation or
-block the review workflow.
-
----
-
-**Design decision:** Use one global `--use-llm/--no-use-llm` CLI switch for
-optional hosted-model behavior.
-
-**Reason:** The project will add optional LLM behavior in multiple places
-(judge, repair planner, and possibly generation polish). A single top-level
-switch avoids a sprawl of unrelated flags and makes runs easier to reproduce.
-The existing `evaluate --llm-judge` flag remains supported for compatibility,
-but `kgmle --use-llm evaluate` is the preferred workflow.
-
-### Judge Dimensions
-
-The judge dimensions are chosen specifically for training tool-use agents:
-
-- `task_completion` (0-10): measures whether the final assistant response
-  actually satisfies the user's request. This is the main supervised signal
-  for whether the trajectory is worth training on.
-- `tool_trace_validity` (0-10): measures whether the assistant selected valid
-  tools, called them in a coherent order, and received compatible tool
-  responses. Tool-use agents need valid action traces, not just good final
-  prose.
-- `argument_grounding` (0-10): measures whether tool-call arguments come from
-  user input, planned values, or prior tool outputs. This catches fabricated
-  IDs and unsupported chained arguments, which are among the most harmful
-  errors for tool-learning data.
-- `response_grounding` (0-10): measures whether the assistant's final answer
-  stays faithful to the tool outputs. This prevents training examples where
-  the model calls tools correctly but then hallucinates the answer.
-- `naturalness` (0-10): measures whether the dialogue reads like a plausible
-  user-assistant interaction. This matters because the dataset is intended
-  for conversational agents, not only API-call planners.
-- `overall_score` (0-10): holistic score used for filtering and comparing
-  runs. It is not required to be a simple average; severe tool or grounding
-  failures can dominate.
-- `confidence` (0-10): judge confidence in its own score, used to identify
-  records that may need deterministic review or re-judging.
-
-The dimensions intentionally separate *trace correctness* from *answer
-quality*. A conversation can have natural wording but a bad tool trace, or
-a valid tool trace but an ungrounded final answer; both cases should be
-visible to the filtering logic.
-
-Design decision:
-
-- Make deterministic evaluation the default.
-- Make LLM-as-judge opt-in through global `--use-llm`; keep
-  `evaluate --llm-judge` as a compatibility alias.
-- Validate judge output with Pydantic before it is accepted.
-
-Reason:
-
-- Reviewers can run evaluation offline.
-- LLM judging demonstrates rubric-style qualitative assessment without
-  making the project fail when hosted inference is unavailable.
-- Structured judge output keeps scores machine-readable and prevents
-  free-text-only evaluation from becoming hard to aggregate.
-
-Judge schema:
+### Quality bands (in `metadata.evaluation`)
 
 ```text
-task_completion     0-10
-tool_trace_validity 0-10
-argument_grounding  0-10
-response_grounding  0-10
-naturalness         0-10
-overall_score       0-10
-confidence          0-10
-issues
-rationale
+gold    deterministic ≥ 9.0, no tool errors, no major judge issues
+silver  deterministic ≥ 8.0, no unresolved tool errors
+reject  validation fail, unresolved tool error, deterministic < 8.0,
+        or major tool/grounding/task-completion judge fail
 ```
 
-The judge prompt explicitly tells the model to score only visible JSON,
-penalize missing role tags, missing tool responses, invented tool IDs,
-unresolved tool errors, and ungrounded arguments.
+`usable_for_training` is a derived boolean used by downstream filters.
 
-Each scored conversation stores the evaluation under:
+### Honest gaps
+
+- The judge prompt explicitly tells the model to score only visible JSON
+  and not infer real API behaviour. LLMs sometimes do anyway. The
+  rationale field helps spot this; I don't have an automatic detector.
+- The 8.0 threshold for "usable" is by-eye, not by data — chosen because
+  the rubric language ("good, minor issue") corresponds to 8 on a 0–10
+  scale. No correlation study against actual training-time downstream
+  performance was possible inside the project's time budget.
+- The 100-sample E2E test uses a *deterministic fake judge* at the
+  provider boundary (`tests/e2e/test_pipeline_100.py`). The fake gives
+  every record a score of 8 or 9, so the test's `mean ≥ 8.0` assertion
+  catches structural regressions but not actual judging quality. A real
+  hosted judge run on 100 records exists as a manual smoke step, not
+  in CI.
+
+## 9. Retry and Repair
+
+`src/kg_mle/repair/`
+
+Bounded post-evaluation repair pass:
 
 ```text
-metadata.evaluation
+conversation → evaluate → detect triggers → RepairPlan → apply or record → re-evaluate
 ```
-
-This includes deterministic metrics, the 0-10 deterministic score, and the
-optional LLM judge result or provider error. The original generated input
-JSONL is not overwritten; `kgmle evaluate` writes a separate scored JSONL so
-reviewers can compare raw vs evaluated artifacts.
-
-## 15. Retry And Repair
-
-The assignment requires the system to attempt repair when a generated
-conversation fails validation or scores below a quality threshold. Repair is
-implemented as an evaluation-time bounded pass:
 
 ```text
-conversation
--> evaluate
--> detect validation/quality triggers
--> create RepairPlan
--> apply safe deterministic repair or mark coordinator-required repair
--> re-evaluate once
--> write repair history into metadata and metrics
+models.py    RepairTrigger, RepairPlan, RepairResult, RepairStrategy
+policy.py    RepairPolicy thresholds + should_attempt_repair + assign_quality_band
+planner.py   DeterministicRepairPlanner + LLMRepairPlanner (advisory; apply still local)
 ```
 
-Command:
-
-```powershell
-kgmle evaluate --repair --repair-threshold 8.0 --max-repair-attempts 1
-```
-
-Repair module:
+### Repair triggers
 
 ```text
-src/kg_mle/repair/
-├── models.py   # RepairTrigger, RepairPlan, RepairResult
-├── policy.py   # thresholds, trigger detection, quality bands
-└── planner.py  # deterministic + LLM repair planners, safe local repairs
+schema validation failure
+role/message sequence failure
+tool error in the trace
+deterministic_score      < 8.0
+tool_trace_validity      < 8.0    (when LLM-judged)
+argument_grounding       < 8.0
+task_completion          < 9.0
+naturalness              < 5.0
 ```
 
-### Repair Triggers
+### Strategies and what actually applies
 
-Repair is attempted when any of the following are observed:
+| Strategy | Applied by | Status |
+|---|---|---|
+| `rewrite_final_response` | Deterministic planner | Applied in place. Composes a grounded summary from existing tool outputs. |
+| `mark_rejected` | Deterministic planner | Recorded; conversation kept for analysis. |
+| `apply_graph_verified_chain_change` | Coordinator | Plan recorded; status `failed` in the evaluator pass because the evaluator doesn't re-run the coordinator. |
+| `regenerate_conversation` | Coordinator | Plan recorded; status `failed` in the evaluator pass. |
+| `fix_tool_arguments` | Coordinator | Plan recorded; same reason. |
+| `insert_clarification` | Coordinator | Plan recorded; same reason. |
 
-- schema validation failure
-- role/message validation failure
-- tool error in the trace
-- `deterministic_score < 8.0`
-- `tool_trace_validity < 8.0`
-- `argument_grounding < 8.0`
-- `task_completion < 9.0`
-- `naturalness < 5.0`
+This is the honest reading: the post-evaluation pass can only safely
+do final-response rewrites in place. The four coordinator-required
+strategies are recorded with reasoning so the trail is visible, but the
+evaluator doesn't try to mutate state it doesn't have access to. The
+PDF asks the system to "attempt to repair … rather than simply discard
+it"; recording a planned-but-failed repair satisfies that intent
+honestly. A future regenerator pass that re-invokes the coordinator
+from the evaluate command would close this — it's not in the submitted
+build.
 
-The default repair budget is one attempt per conversation.
+### LLM repair planner
 
-### Repair Plans
+`--use-llm evaluate --repair` swaps in `LLMRepairPlanner`. The LLM
+proposes a `RepairPlan` (same Pydantic schema), but application still
+goes through the deterministic apply layer — hosted output never
+directly mutates a conversation.
 
-Repair returns a structured plan rather than free-form instructions:
+| Decision | Alternative | Why |
+|---|---|---|
+| Repair module owns policy + planning; coordinator owns stateful application | Single module that does both | The evaluator runs on serialized conversations; only the coordinator has live executor state. |
+| Fixed budget of one repair attempt | Unbounded retry | Bounds cost; demonstrates the loop without dominating the run. |
+| Chain-changing repairs are graph-verified | Free-form chain edits | Mutating chains without graph proof would create new hallucination risk. |
+| LLM repair plans are advisory; apply stays deterministic | LLM rewrites the conversation directly | Validation pipeline stays single-path; LLM output is constrained to the `RepairPlan` schema. |
+
+### Honest gap
+
+- The four coordinator-required strategies that always return `failed`
+  in the evaluator pass are the biggest unfinished piece. The plan is
+  recorded with reasoning, which is the honest answer ("here's what
+  should happen, here's why we couldn't do it in this pass"), but a
+  reviewer wanting to see end-to-end repair will only see
+  `rewrite_final_response` actually applied.
+
+## 10. Context Management and Diversity
+
+### Within-conversation grounding
+
+`ExecutorSession` is the single source of truth for one conversation's
+state:
 
 ```text
-RepairPlan
-├── strategy
-├── triggers
-├── reason
-├── target_step / target_endpoint
-├── proposed_arguments
-├── proposed_final_response
-├── proposed_chain_change
-├── requires_coordinator
-└── confidence
+issued_ids                  field_name (and canonical_name) → [values...]
+_responses_by_endpoint      endpoint → [response dicts...]
+log                         chronological tool_call / tool_response / tool_error
 ```
 
-Current strategies:
+The generator never invents IDs because:
 
-- `rewrite_final_response`
-- `apply_graph_verified_chain_change`
-- `regenerate_conversation`
-- `mark_rejected`
-- `fix_tool_arguments`
-- `insert_clarification`
+1. `session.suggest_arguments(endpoint_id)` pulls grounded params from
+   `issued_ids[source_field]` (or canonical), and pool-samples free
+   params from `CANONICAL_EXAMPLES`.
+2. `session.example_values(endpoint_id)` exposes the same data as a
+   few-shot pool the LLM can render into its prompt.
+3. The validator strict-checks every grounded parameter against
+   `issued_ids` before mocking — hallucination → typed error inline.
 
-The deterministic planner applies only local safe repairs in the evaluator:
-currently this means final-response rewrites grounded in existing tool
-outputs. Repairs that need the coordinator, executor state, or graph mutation
-are planned and recorded as coordinator-required. This keeps the submitted
-pipeline honest: it attempts repair, records the required action, and does
-not pretend to re-run a stateful conversation when the required state is not
-available in the evaluation artifact.
+### Cross-conversation steering
 
-When the global LLM switch is enabled, the evaluator uses an LLM repair
-planner:
-
-```powershell
-kgmle --use-llm evaluate --repair
-```
-
-The LLM planner still returns the same Pydantic `RepairPlan` schema. If the
-model returns malformed JSON, an invalid strategy, or out-of-range confidence,
-the planner falls back to the deterministic planner. Applying the plan still
-goes through the deterministic repair application layer so hosted-model output
-does not directly mutate conversations.
-
-### Repair Metadata
-
-Every scored conversation includes repair information when a repair was
-attempted:
+`CorpusSteerer` is corpus-level statistical memory:
 
 ```text
-metadata.repair_history
-metadata.evaluation.repair
-metadata.evaluation.quality_band
-metadata.evaluation.usable_for_training
+domain counts             tool counts             endpoint counts
+endpoint-pair counts      chain-length counts     domain-pattern counts
 ```
 
-The metrics JSON also includes:
-
-```text
-repair_summary
-├── enabled
-├── attempted
-├── repaired
-├── failed
-├── rejected
-├── regenerated
-└── status_counts
-```
-
-Quality bands:
-
-- `gold`: deterministic score >= 9, no tool errors, and no major LLM judge
-  issues when judge scores are present.
-- `silver`: deterministic score >= 8 and no unresolved tool errors.
-- `reject`: validation failure, unresolved tool error, deterministic score <
-  8, or major tool/grounding/task-completion judge failure.
-
-### Repair Design Decisions
-
-**Design decision:** Use a hybrid repair model.
-
-**Reason:** Some issues are best repaired inline during generation, where the
-coordinator has executor state. Others are discovered only after evaluation
-or LLM judging. The current implementation provides the post-generation pass
-and records coordinator-required repairs; future work can hand those plans
-back into the coordinator for full regeneration.
-
----
-
-**Design decision:** Repair module owns policy and planning; coordinator owns
-stateful application.
-
-**Reason:** The repair module should decide what needs to change. The
-coordinator/executor should apply changes that require conversation state,
-tool outputs, or graph validation. This separation prevents the evaluator
-from duplicating generation logic.
-
----
-
-**Design decision:** Fixed repair budget of one attempt.
-
-**Reason:** One repair attempt demonstrates the required retry/repair loop
-while bounding hosted-model cost, latency, and nondeterminism.
-
----
-
-**Design decision:** Deterministic repair first, optional LLM repair planner
-behind global `--use-llm`.
-
-**Reason:** The project is offline-first. Deterministic repair is testable
-without credentials. LLM repair uses the same provider-neutral client and the
-same `RepairPlan` schema, so it can improve planning quality without bypassing
-validation or deterministic application guardrails.
-
----
-
-**Design decision:** Chain-changing repairs are allowed only when
-graph/coordinator validation can prove them.
-
-**Reason:** Low scores can mean the sampled chain itself is bad, but changing
-chains without graph validation would create new hallucination risk. The
-planner records graph-verified-chain-change as the appropriate strategy,
-but the evaluator does not mutate chains directly.
-
-## 16. Prompt Design
-
-Hosted-model usage is optional, but when enabled the project uses structured
-prompts and Pydantic validation instead of accepting free-form LLM text.
-
-### Planner Prompt
-
-The planner prompt receives:
-
-- sampled tool chain
-- endpoint schemas
-- required parameters
-- ambiguity policy
-- output schema for `Plan`
-
-It must return a JSON object that validates as:
-
-```text
-Plan
-├── conversation_intent
-├── user_character
-├── plan_confidence
-├── step_plans
-└── ambiguous_step_indices
-```
-
-Design decision:
-
-- Ask the planner for parameter plans and ambiguity flags, not final
-  conversation text.
-
-Reason:
-
-- The coordinator can validate parameters, route clarifications, and preserve
-  deterministic executor grounding. A free-form dialogue plan would be harder
-  to repair and easier to hallucinate.
-
-### Assistant Prompt
-
-The assistant prompt receives compact state:
-
-- transcript so far
-- current step
-- endpoint schema
-- suggested arguments from executor state
-- prior output examples
-- confidence thresholds
-
-It returns an `AssistantTurn` object:
-
-```text
-clarification | tool_calls | final_summary
-```
-
-Tool-call turns must include structured `ToolCallProposal` objects with
-endpoint id, argument dict, and confidence.
-
-Design decision:
-
-- Keep tool-call generation schema-bound and let the executor reject
-  ungrounded arguments.
-
-Reason:
-
-- The assistant can propose, but the executor proves. This keeps LLM fluency
-  separate from trace correctness.
-
-### Judge Prompt
-
-The judge prompt includes the full conversation JSON and a rubric. It tells
-the model to score only visible evidence and return JSON with:
-
-```text
-task_completion
-tool_trace_validity
-argument_grounding
-response_grounding
-naturalness
-overall_score
-confidence
-issues
-rationale
-```
-
-All score fields are validated on a `0..10` range.
-
-### Repair Prompt
-
-The repair prompt receives:
-
-- conversation JSON
-- repair triggers
-- current scores
-- allowed repair strategies
-- output schema for `RepairPlan`
-
-The LLM may propose a plan, but applying the plan still goes through the
-deterministic repair layer.
-
-Design decision:
-
-- LLM repair plans are advisory and schema-constrained.
-
-Reason:
-
-- This demonstrates LLM planning while preventing hosted-model output from
-  directly mutating a trace without validation.
-
-### Failed Prompt Iteration
-
-An earlier registry-enrichment prompt attempted to call Hugging Face-hosted
-models as generic chat models. Two failures followed:
-
-- Gemma was not available through the selected Hugging Face chat route.
-- Qwen returned JSON-shaped suggestions through the router, but the provider
-  hit billing/quota limits before a full enrichment run.
-
-What changed:
-
-- Registry enrichment now uses the same provider-neutral
-  `StructuredLLMClient` as judge and repair.
-- Gemini/Groq/OpenAI-compatible providers can be swapped through `.env`.
-- Hugging Face remains supported as a lower-level adapter, but it is not the
-  only enrichment path.
-- Deterministic enrichment remains the default fallback, so the pipeline is
-  runnable without hosted credentials.
-
-Lesson:
-
-- Prompt quality is not enough if the provider interface is brittle. The
-  project needs provider-neutral structured JSON calls, strict validation, and
-  deterministic fallbacks.
-
-## 17. Context Management
-
-Context is managed at two levels:
-
-```text
-within-conversation context
-cross-conversation corpus context
-```
-
-The two serve different purposes. Within-conversation context keeps one tool
-trace grounded. Cross-conversation context makes the generated corpus diverse.
-
-### Within-Conversation Context
-
-Within one conversation, `ExecutorSession` and `SessionState` are the source
-of truth.
-
-They track:
-
-- successful tool calls
-- failed tool calls
-- tool responses
-- issued IDs
-- issued string fields
-- canonical field aliases
-- chronological tool log
-
-The generator accesses this state through narrow APIs:
-
-```python
-session.suggest_arguments(endpoint_id)
-session.example_values(endpoint_id)
-session.call(endpoint_id, arguments)
-```
-
-Design decision:
-
-- Keep runtime context in executor state, not only in prompt text.
-
-Reason:
-
-- Grounding must be machine-checkable. A prompt can suggest prior values, but
-  the executor state can prove whether a value was actually returned by an
-  earlier tool.
-
-### Grounding And Canonical Aliases
-
-When a tool returns a string field, the session registers it under both the
-literal field name and the canonical name when present.
-
-Example:
-
-```text
-food/check_availability returns available_time
-available_time canonical_name = start_time
-events/create_calendar_event requires start_time
-```
-
-The session stores the returned value under:
-
-```text
-available_time
-start_time
-```
-
-This lets a later `start_time` parameter use the previous
-`available_time` output without inventing a new value.
-
-Design decision:
-
-- Strict grounding applies to all grounded parameters, not only ID-shaped
-  parameters.
-
-Reason:
-
-- ToolBench-style chains can ground non-ID values such as `symbol`, `city`,
-  `date`, and `start_time`. If the assistant invents one of those values
-  instead of using the previous output, the trace should fail.
-
-### LLM Prompt Context
-
-LLM agents receive compact structured context:
-
-- plan
-- transcript so far
-- current step
-- suggested arguments
-- example values
-- relevant thresholds
-
-Design decision:
-
-- Pass structured context instead of large unbounded memory dumps.
-
-Reason:
-
-- It reduces hallucination surface area, lowers token cost, and makes LLM
-  outputs easier to validate through Pydantic.
-
-### Cross-Conversation Context
-
-Cross-conversation context is corpus-level statistical memory, implemented by
-`CorpusSteerer` and `CorpusCounters`.
-
-It tracks:
-
-- domain counts
-- tool counts
-- endpoint counts
-- endpoint-pair counts
-- chain length counts
-- domain-pattern counts
-
-Flow:
-
-```text
-sample conversation N
--> record domains/tools/endpoints/pairs
--> update corpus counters
--> shape constraints for conversation N+1
-```
-
-This context answers:
-
-```text
-What kind of chain should we sample next to improve corpus diversity?
-```
-
-It does not answer:
-
-```text
-What argument value should this tool call use?
-```
-
-That second question belongs to within-conversation executor state.
-
-Design decision:
-
-- Use statistical counters, not long-term semantic memory, for
-  cross-conversation steering.
-
-Reason:
-
-- The assignment needs diversity control and a steering-on/off experiment.
-  Counters are deterministic, inspectable, cheap, and directly tied to the
-  diversity metrics. Persistent user memory would add privacy and complexity
-  without improving the required tool-use dataset.
-
-### Steering And Relaxation
-
-The corpus planner can use cross-conversation counters to:
-
-- prefer underused domains
-- forbid overused endpoints
-- diagnose overused endpoint pairs
-- vary chain length and domain patterns
-
-If steering over-constrains sampling, the planner relaxes constraints rather
-than dropping the record.
-
-Relaxation order:
-
-1. reduce grounded-transition requirement
-2. remove required domains
-3. reduce distinct-domain requirement
-4. stop forbidding overused endpoints
-5. reduce distinct-tool requirement
-6. reduce chain length only as a last resort
-
-Design decision:
-
-- Relax steering before failing generation.
-
-Reason:
-
-- A valid slightly less-diverse conversation is better than silently losing a
-  record, especially in a fixed-size corpus.
-
-### Mem0 And Semantic Context
-
-Mem0 is used only for optional semantic graph expansion, not as runtime user
-memory.
-
-Endpoint cards are added with `infer=False`.
-
-Design decision:
-
-- Do not let Mem0's LLM memory extraction rewrite endpoint cards.
-
-Reason:
-
-- Endpoint cards are already structured schema facts. LLM rewriting would add
-  cost, latency, nondeterminism, and the risk of dropping parameter names.
-
-### Repair Context
-
-Inline repair during generation can use live executor context. Post-generation
-repair has only the serialized conversation, metrics, and tool outputs.
-
-Design decision:
-
-- Post-generation repair applies only safe local edits directly. Repairs that
-  need executor state, graph mutation, or chain regeneration are planned and
-  recorded as coordinator-required.
-
-Reason:
-
-- The evaluator should not pretend it can safely mutate a stateful trace after
-  the session has ended.
-
-### Context Management Limitations And Scale Tradeoffs
-
-Limitations:
-
-- Cross-conversation steering is counter-based, so it cannot understand deep
-  semantic novelty by itself.
-- Endpoint-pair overuse is recorded and surfaced for diagnostics, but the
-  current walker does not yet support direct pair-level forbidding.
-- Within-conversation context is per-session only; no user preferences persist
-  across conversations.
-- Post-generation repair cannot reconstruct full executor state unless the
-  coordinator is rerun.
-
-Scale tradeoffs:
-
-- In-memory session state is simple and fast for the curated subset and 100+
-  sample runs.
-- Corpus counters are O(number of generated chains) and cheap to serialize.
-- Full ToolBench scale may require indexed graph traversal, cached embeddings,
-  and possibly a graph/vector store for artifact exploration.
-- We avoid external databases in the submitted MVP so reviewers can run the
-  pipeline without service setup.
-
-### Context Tests
-
-Implemented tests cover:
-
-- strict grounding rejects hallucinated grounded values
-- previous tool outputs validate when reused
-- canonical response aliases ground later parameters
-- `example_values()` exposes issued prior outputs to LLM agents
-- steering counters track domains, tools, endpoints, endpoint pairs, chain
-  lengths, and domain patterns
-- steering on/off produces different corpora while both runs retain
-  comparable counters
-
-## 18. Diversity Experiment
-
-The diversity experiment compares two corpus-generation runs:
-
-```text
-Run A: cross-conversation steering disabled
-Run B: cross-conversation steering enabled
-```
-
-Both runs use:
-
-- same fixture
-- same seed
-- same target count
-- same deterministic evaluator
-- same optional LLM settings when `--use-llm` is enabled
-
-Planned command:
-
-```powershell
-kgmle diversity --count 100 --seed 42
-kgmle --use-llm diversity --count 100 --seed 42 --max-llm-judge-records 10
-```
-
-Planned artifacts:
-
-```text
-artifacts/diversity/
-├── run_a_no_steering.jsonl
-├── run_b_steering.jsonl
-├── run_a_metrics.json
-├── run_b_metrics.json
-├── run_a_scored.jsonl
-├── run_b_scored.jsonl
-└── diversity_report.json
-```
-
-### Diversity Metrics
-
-The report should include:
-
-- `domain_entropy`: Shannon entropy over domain usage.
-- `endpoint_coverage_ratio`: distinct endpoints used / total endpoints.
-- `tool_coverage_ratio`: distinct tools used / total tools.
-- `distinct_endpoint_pair_ratio`: distinct endpoint pairs / total transitions.
-- `chain_length_distribution`: generated conversation length spread.
-- `domain_pattern_diversity`: number of distinct domain-transition patterns.
-- `top_endpoint_share`: concentration of the most-used endpoint.
-- `mean_deterministic_score`: quality comparison between runs.
-- `repair_attempt_rate`: fraction of records requiring repair.
-- `usable_for_training_rate`: final dataset usability.
-
-### Diversity Design Decisions
-
-**Design decision:** Compare steering on/off with the same seed.
-
-**Reason:** The experiment should isolate the effect of cross-conversation
-steering. Holding seed, count, and fixture constant makes the comparison
-reproducible and defensible.
-
----
-
-**Design decision:** Use deterministic metrics by default.
-
-**Reason:** The diversity experiment should run offline in a reviewer
-environment. Optional LLM judging can be enabled with `--use-llm`, but the
-core diversity result should not depend on hosted-model availability.
-
----
-
-**Design decision:** Report diversity and quality together.
-
-**Reason:** Higher diversity is only useful if quality does not collapse.
-The experiment therefore compares coverage/entropy metrics alongside
-deterministic score, repair rate, and usable-for-training rate.
-
----
-
-**Design decision:** Save both raw and scored datasets for each run.
-
-**Reason:** Raw JSONL lets reviewers inspect generated conversations before
-evaluation. Scored JSONL carries `metadata.evaluation`, quality bands, and
-repair history for filtering and analysis.
-
----
-
-**Design decision:** Prefer transparent metrics over black-box embedding
-diversity for the submitted MVP.
-
-**Reason:** Domain counts, endpoint coverage, endpoint-pair diversity, and
-entropy are easy to inspect and directly tied to the graph/sampler behavior.
-Embedding diversity can be added later, but it would add another model
-dependency and make the experiment harder to reproduce.
-
----
-
-**Design decision:** Use the same provider-neutral judge path when
-`--use-llm` is enabled.
-
-**Reason:** The experiment can include qualitative LLM scores without tying
-the implementation to Gemini specifically. Any supported provider can be
-selected through `.env`; `--max-llm-judge-records` bounds cost and latency.
-
-### Diversity Experiment Results
-
-Command:
+It answers "what kind of chain should we sample next to improve corpus
+diversity?", not "what argument value should this tool call use?" The
+counters drive `forbid_endpoint_ids` (hard exclusion) and a
+least-used-domain hint for `required_domains` (soft preference).
+
+`NullSteerer` is the on/off symmetry: same Protocol, no forbidding, no
+biasing — but still records counters so Run A and Run B have
+comparable metrics.
+
+### Diversity experiment
 
 ```powershell
 kgmle diversity --count 100 --seed 42 --output-dir artifacts/diversity
 ```
 
-Both runs used the same fixture, seed, count, deterministic evaluator, and no
-LLM judge. The only difference was cross-conversation steering.
+Two runs with the same seed/count/fixture, only the steering flag
+differs. Six diversity metrics + four quality metrics:
 
-| Metric | Run A: no steering | Run B: steering | Delta |
+| Metric | Run A: no steering | Run B: steering | Δ |
 |---|---:|---:|---:|
-| domain entropy | 2.5304 | 2.7039 | +0.1735 |
-| endpoint coverage ratio | 0.7778 | 0.8889 | +0.1111 |
-| tool coverage ratio | 0.8889 | 1.0000 | +0.1111 |
-| distinct endpoint-pair ratio | 0.3125 | 0.3042 | -0.0083 |
+| domain entropy | 2.5304 | 2.7039 | **+0.1735** |
+| endpoint coverage ratio | 0.7778 | 0.8889 | **+0.1111** |
+| tool coverage ratio | 0.8889 | 1.0000 | **+0.1111** |
+| distinct endpoint-pair ratio | 0.3125 | 0.3042 | −0.0083 |
 | domain pattern diversity | 12 | 13 | +1 |
-| top endpoint share | 0.2235 | 0.1912 | -0.0323 |
+| top endpoint share | 0.2235 | 0.1912 | **−0.0323** |
 | mean deterministic score | 9.9600 | 10.0000 | +0.0400 |
 | chain completion | 0.9900 | 1.0000 | +0.0100 |
-| tool response coverage | 1.0000 | 1.0000 | 0.0000 |
 | schema valid rate | 1.0000 | 1.0000 | 0.0000 |
 | usable-for-training rate | 0.9900 | 1.0000 | +0.0100 |
 
-Interpretation:
+**Interpretation.**
 
-- Steering improved broad coverage: more endpoints, all tools, higher domain
-  entropy, and one additional domain pattern.
-- Steering reduced concentration: the most-used endpoint's share dropped from
-  22.35% to 19.12%.
-- Distinct endpoint-pair ratio decreased slightly, which is acceptable here
-  because the steered run generated more total transitions while preserving
-  high quality. Pair-level forbidding is currently diagnostic rather than an
-  active walker constraint.
-- Quality did not degrade. The steered run had perfect deterministic score,
-  chain completion, schema validity, and usable-for-training rate.
+- Steering widened coverage: +1 endpoint covered, all tools used, +0.17
+  on domain entropy, +1 domain pattern.
+- Concentration dropped: the most-used endpoint went from 22% to 19% of
+  chains.
+- Distinct endpoint-pair ratio fell slightly (−0.008). This is an
+  artifact of the steered run producing **more total transitions** while
+  the distinct-pair count grew less than proportionally — i.e., the
+  same pairs appearing across more chains. Honest reading: the
+  endpoint-pair diversity metric is sensitive to total-transition
+  count, and the slight drop isn't a quality regression.
+- **Quality did not degrade.** The steered run hit perfect deterministic
+  score, schema validity, and chain completion.
 
-Artifacts:
+| Decision | Alternative | Why |
+|---|---|---|
+| Counter-based steering; not semantic memory | Persistent vector memory | Counters are deterministic, inspectable, directly tied to the metrics; vector memory is overkill for a 100-sample corpus. |
+| Both runs use the same seed/count/fixture | Different seeds per run | The experiment must isolate steering's effect. |
+| Six metrics + quality | Single "diversity score" | Steering can improve some metrics and hurt others; the comparison should expose that. |
+| Transparent metrics (counts, entropy, ratios) | Embedding-distance diversity | Tied directly to graph/sampler behavior; reproducible without an embedding model. |
 
-```text
-artifacts/diversity/run_a_no_steering.jsonl
-artifacts/diversity/run_b_steering.jsonl
-artifacts/diversity/run_a_metrics.json
-artifacts/diversity/run_b_metrics.json
-artifacts/diversity/run_a_scored.jsonl
-artifacts/diversity/run_b_scored.jsonl
-artifacts/diversity/diversity_report.json
-```
+### Honest gaps
 
-### Diversity Experiment Limitations
+- **The fixture is small.** Diversity metrics are meaningful for relative
+  comparison but not a claim about full-ToolBench coverage. The 22→19%
+  drop in top-endpoint share is real; whether it generalises to larger
+  corpora is untested.
+- **Endpoint-pair forbidding is diagnostic-only.** The walker doesn't
+  directly forbid pairs; it forbids endpoints. The pair counter is
+  recorded for visibility but doesn't feed back into sampling.
+- **Steering and length distribution are independent knobs.** They could
+  interact (e.g., forbidding overused endpoints might bias toward longer
+  or shorter chains depending on graph topology). I haven't measured
+  this interaction.
 
-- The curated fixture is small, so diversity metrics are meaningful for
-  relative comparison but not a claim about full ToolBench coverage.
-- The sampler still works over an in-memory graph; full ToolBench scale may
-  need indexed graph traversal and cached semantic neighbors.
-- Endpoint-pair overuse is currently diagnostic; direct pair-level forbidding
-  is future work.
-- Optional LLM judging introduces provider variance, so deterministic quality
-  metrics remain the primary comparison.
+## 11. Prompt Design
 
-## 19. Build/Generate Feature Flags
+LLM features all use the same `StructuredLLMClient` and the same
+pattern: structured JSON in, Pydantic out, retry once with error
+context, deterministic fallback.
 
-The intended workflow is:
+### Planner prompt
 
-```powershell
-kgmle build
-kgmle generate
-kgmle evaluate
-```
+Receives: sampled tool chain, endpoint schemas, required parameters,
+ambiguity policy, output schema for `Plan`. Returns a JSON `Plan`.
+Rationale: ask the planner for *parameter plans and ambiguity flags*,
+not final conversation text — the coordinator validates parameters,
+routes clarifications, and preserves executor grounding. A free-form
+dialogue plan would be harder to validate and easier to hallucinate.
 
-`build` writes the normalized registry and graph artifacts. `generate` now
-loads those artifacts by default when they exist, instead of rebuilding a
-plain graph from raw input. This matters for semantic matching: a graph built
-with semantic expansion keeps its `semantic_related` edges available to the
-sampler during generation.
+### Assistant prompt
 
-Global `--use-llm` has consistent behavior across commands:
+Receives: transcript so far, current step, endpoint schema, suggested
+arguments from executor state, prior output examples, confidence
+thresholds. Returns an `AssistantTurn`. Rationale: the assistant can
+propose, but the executor proves. Schema-bound tool-call proposals +
+strict executor validation = LLM fluency without trace risk.
 
-- `build`: enables provider-neutral structured registry enrichment and
-  semantic graph construction.
-- `generate`: if build artifacts are missing, performs the same LLM registry
-  enrichment and semantic graph construction path; it also allows semantic
-  edges in the sampler.
-- `evaluate`: enables the LLM judge and, when `--repair` is set, the LLM
-  repair planner.
-- `diversity`: enables LLM registry enrichment, semantic graph construction,
-  semantic-edge traversal, and LLM judging.
+### Judge prompt
 
-Semantic traversal remains opt-in without `--use-llm`:
+Receives: full conversation JSON, rubric. Returns the 5 dimensions +
+overall + confidence + issues + rationale. Explicit instruction:
+score only visible evidence; penalise missing role tags, missing tool
+responses, invented tool IDs, unresolved tool errors, ungrounded
+arguments.
 
-```powershell
-kgmle build --semantic-graph --semantic-backend local
-kgmle generate --allow-semantic-edges
-kgmle diversity --semantic-graph --allow-semantic-edges
-```
+### Repair prompt
 
-Design decision:
+Receives: conversation JSON, triggers, current scores, allowed
+strategies, output schema for `RepairPlan`. The LLM may propose, but
+applying the plan still runs through the deterministic apply layer.
 
-- Separate "graph contains semantic edges" from "sampler may traverse semantic
-  edges."
+### Failed prompt iteration
 
-Reason:
+An earlier registry-enrichment prompt called Hugging Face-hosted models
+as generic chat models with the model name `google/gemma-4-E2B-it`.
 
-- Semantic similarity is useful for candidate discovery, but it is weaker than
-  a grounded output-to-input edge. The sampler therefore still prioritizes
-  grounded edges, then same-domain edges, then semantic edges. This reduces
-  hallucinated chain risk while still allowing semantic hops when they help
-  satisfy diversity or reach a useful cross-domain transition.
+**What went wrong:**
 
-Smoke result:
+- Gemma wasn't available through the selected HF chat route.
+- Switching to `Qwen/Qwen2.5-3B-Instruct` + `featherless-ai` provider
+  returned JSON-shaped suggestions, but hit `402 Payment Required` after
+  one call.
 
-```text
-kgmle build --semantic-graph --semantic-backend local --artifacts-dir artifacts/e2e10_semantic_flow
-kgmle generate --count 10 --seed 42 --artifacts-dir artifacts/e2e10_semantic_flow --allow-semantic-edges
-```
+**What changed:**
 
-The built graph contained 4 semantic edges. The 10-record generated sample
-used 2 semantic transitions:
+- Registry enrichment, judge, repair, and generator agents now all use
+  the same provider-neutral `StructuredLLMClient`.
+- Gemini is the default (free tier exists, JSON mode is stable).
+- Groq is the open-model backup.
+- HF remains available as an adapter but isn't the default path.
+- Deterministic fallback was added everywhere LLMs are used.
 
-```text
-events/book_tickets -> travel/book_itinerary
-travel/book_itinerary -> events/book_tickets
-```
+**Lesson:** prompt quality is not enough if the provider interface is
+brittle. Provider-neutral structured JSON + strict validation +
+deterministic fallback is the load-bearing combination.
 
-Quality remained unchanged in the offline evaluator:
+## 12. Output Schema and CLI
 
-```text
-records=10
-mean_deterministic_score=10.0
-schema_valid_rate=1.0
-tool_response_coverage=1.0
-repair_attempted=0
-```
-
-Repair is intentionally not part of `generate`. Generation handles inline
-structured-output retries, but validation failures and low judge scores are
-known only after evaluation. The repair loop therefore belongs to:
-
-```powershell
-kgmle evaluate --repair
-kgmle --use-llm evaluate --repair
-```
-
-## 20. Output Schema Validation
-
-The output artifacts are validated with Pydantic schemas in:
+`src/kg_mle/schema/` — Pydantic artifact schemas matching the PDF's
+record shape:
 
 ```text
-src/kg_mle/schema/
-├── records.py    # generated and scored conversation JSONL records
-├── metrics.py    # evaluation metrics JSON
-└── diversity.py  # diversity experiment report JSON
+records.py     GeneratedConversationRecord, ScoredConversationRecord
+metrics.py     EvaluationMetricsArtifact, MetricsSummary, RepairSummary
+diversity.py   DiversityReport
+common.py      LLMJudgeScore (also re-exports the judge's Pydantic shape)
 ```
 
-Design decision:
-
-- Treat Pydantic models as the schema source of truth instead of maintaining a
-  separate JSON Schema file.
-
-Reason:
-
-- The code already uses Pydantic for registry, graph, generator, judge, and
-  repair contracts. Reusing the same validation system avoids schema drift and
-  keeps tests close to the runtime objects reviewers will inspect.
-
-### Conversation Record Schemas
-
-Generated records validate the base conversation protocol:
+**Generated record** (one JSONL line):
 
 ```text
-conversation_id
-messages
-plan
+conversation_id      string
+messages             list of {role, content, tool_calls?}
+plan                 the Plan that drove generation
 metadata
+  ├── seed, original_chain, final_chain, n_tool_calls, domains
+  ├── advance_type_counts, transition_summary
+  ├── clarifications_taken[], repair_attempts[]
+  └── deviations_accepted[], deviations_rejected[]
 ```
 
-The schema also requires generation metadata needed for downstream analysis:
+**Scored record** = generated record + `metadata.evaluation` block with
+the deterministic metrics, quality band, usable-for-training flag, and
+optional `llm_judge` result (or `{"error": "..."}` on provider
+failure).
+
+| Decision | Alternative | Why |
+|---|---|---|
+| Pydantic as the schema source of truth | Separate JSON Schema file | Avoids drift between in-memory and on-disk; reuses the same validators code already uses. |
+| Top-level conversation shape strict; metadata extensible (`extra="allow"`) | Strict everywhere | Metadata evolves (steering details, repair history, LLM paths); record shape shouldn't. |
+| LLM judge failures preserved as `{"error": "..."}` | Drop the field on failure | Reviewer needs to know the judge failed — and which records were affected. |
+
+### CLI surface
 
 ```text
-metadata.final_chain
-metadata.n_tool_calls
-metadata.tools_visited
+kgmle build       --input ... --artifacts-dir ...
+                  [--semantic-graph --semantic-backend local|mem0]
+                  [--enrich-registry-fields / --llm-enrich-registry]
+kgmle generate    --count N --seed S --output ...
+                  [--cross-conversation-steering / --no-cross-conversation-steering]
+                  [--allow-semantic-edges]
+kgmle evaluate    --input ... --output ... [--scored-output ...]
+                  [--llm-judge --max-llm-judge-records N]
+                  [--repair --repair-threshold 8.0]
+kgmle diversity   --count N --seed S --output-dir ...
+                  [same semantic + repair flags]
 ```
 
-Scored records require everything above plus:
+Global `--use-llm` is a single switch that turns on hosted features
+across commands consistently:
+
+| Command | Effect of `--use-llm` |
+|---|---|
+| `build` | Enables structured-output registry enrichment + semantic graph. |
+| `generate` | Loads built artifacts; uses LLM agents (with deterministic fallback per turn); enables semantic-edge traversal. |
+| `evaluate` | Enables LLM judge; if `--repair` set, also enables LLM repair planner. |
+| `diversity` | All of the above for both Run A and Run B. |
+
+Individual legacy flags (`--llm-judge`, `--llm-enrich-registry`) are
+preserved for targeted runs.
+
+## 13. Testing
 
 ```text
-metadata.evaluation
+tests/fixtures/      sample-fixture validity + intentional messiness
+tests/unit/          178 unit tests across registry, graph, sampler,
+                     executor, generator, evaluation, repair, schema,
+                     diversity, llm clients
+tests/integration/   CLI smoke + repair + diversity command paths
+tests/integration/*live* 5 @pytest.mark.live tests for Mem0, HF enricher,
+                     LLM generator, diversity-with-LLM
+tests/e2e/           test_pipeline_100.py — full pipeline on 100 samples
 ```
 
-`metadata.evaluation` contains deterministic metrics, quality band,
-usable-for-training flag, and optional LLM judge output.
+**E2E test.** `tests/e2e/test_pipeline_100.py`:
 
-Design decision:
+1. Run `kgmle build` against the fixture.
+2. Run `kgmle generate --count 100 --seed 42`.
+3. Run `kgmle --use-llm evaluate --max-llm-judge-records 100` with a
+   deterministic fake judge at the provider boundary.
+4. Assert:
+   - 100 generated and 100 scored records, all validate through
+     `GeneratedConversationRecord` and `ScoredConversationRecord`.
+   - `summary.mean_llm_overall_score ≥ 8.0` (threshold rationale below).
+   - `schema_valid_rate == 1.0`.
+   - `tool_response_coverage ≥ 0.95`.
+   - ≥ 50% of records have `n_tool_calls ≥ 3` AND `≥ 2` distinct tools.
+   - At least one conversation contains an assistant clarification.
 
-- Keep the top-level conversation shape strict but allow extra metadata fields.
+**Threshold rationale.** `8.0/10` corresponds to "good, minor issue" in
+the judge rubric. High enough to catch broken traces; allows minor
+naturalness imperfections that synthetic conversations naturally have.
 
-Reason:
+**Live tests skip cleanly** when their API key is missing or the
+provider errors out. Their purpose is catching protocol regressions
+(Mem0 result-shape changes, HF API shape changes, JSON-extraction
+parser drift), not asserting LLM quality.
 
-- The top-level JSONL contract should be stable. Metadata is intentionally
-  extensible because sampler steering, repair history, LLM judge details, and
-  future provenance fields evolve faster than the core record shape.
+### Honest gap
 
-### Metrics Artifact Schema
+- The E2E test fakes the judge at the provider boundary, so it asserts
+  the *integration path* is intact (the same code path a real
+  Gemini/Groq judge would traverse) but not real judging quality. A
+  real-provider 100-sample run is a manual step, not CI.
 
-The evaluation metrics artifact validates:
+## 14. Open Areas
 
-```text
-summary
-repair_summary
-records
-```
+What's intentionally not in the submitted build, with honest reasons:
 
-Score fields are constrained to the rubric range `0..10`. Coverage/rate
-fields are constrained to `0..1`. LLM judge results accept either a validated
-judge score object or an error object:
-
-```json
-{"error": "provider quota exceeded"}
-```
-
-Design decision:
-
-- Preserve LLM provider failures as valid artifact data.
-
-Reason:
-
-- Hosted inference is optional and can fail for quota, network, or provider
-  reasons. The pipeline should still produce a usable deterministic evaluation
-  artifact instead of discarding the record.
-
-### Diversity Report Schema
-
-The diversity report schema validates:
-
-```text
-config
-run_a_no_steering
-run_b_steering
-comparison
-artifacts
-```
-
-Each run includes generation stats, diversity metrics, quality metrics, and
-repair summary. Diversity ratios are range-checked, while deltas may be
-negative because steering can improve some metrics and reduce others.
-
-Design decision:
-
-- Validate schema in tests and E2E workflows, not with a separate CLI command.
-
-Reason:
-
-- Generation and evaluation already validate records during normal execution.
-  A separate `kgmle validate` command would add surface area without changing
-  the submitted workflow. Tests provide the stronger guarantee that artifacts
-  stay compatible as the code changes.
-
-## 21. End-To-End Test
-
-The repository includes an offline E2E test:
-
-```text
-tests/e2e/test_pipeline_100.py
-```
-
-It runs:
-
-```text
-kgmle build
-kgmle generate --count 100 --seed 42
-kgmle --use-llm evaluate --max-llm-judge-records 100
-```
-
-The LLM provider is faked at the adapter boundary so the test is deterministic
-and does not require network credentials. This still exercises the same
-LLM-as-judge integration path used by real providers.
-
-Assertions:
-
-- 100 generated records
-- 100 scored records
-- generated and scored JSONL records validate through schema models
-- all 100 records receive judge scores
-- mean judge overall score is at least `8.0`
-- schema valid rate is `1.0`
-- tool response coverage is at least `0.95`
-- at least 50% of records have `>=3` tool calls and `>=2` distinct tools
-- at least one conversation contains assistant clarification before tool use
-
-Threshold rationale:
-
-- `8.0/10` corresponds to "good, minor issue" in the judge rubric. It is high
-  enough to catch broken traces while allowing small naturalness or wording
-  imperfections in synthetic conversations.
-
-## 22. Open Design Areas
-
-Still to implement:
-- Real hosted LLM E2E over all 100 records is intentionally not required in
-  CI because provider quota and latency are unstable. Live provider smoke
-  tests remain opt-in.
+- **Parallel tool calls.** The `AssistantTurn.tool_calls` list is
+  length-1 in v1. The data model is future-proofed (it's already a
+  list), but the sampler's `pattern="parallel"` is a no-op and the
+  executor doesn't have `call_parallel`. Deferred because the rubric's
+  hard requirements (50–60% multi-step + multi-tool, multi-turn
+  disambiguation, structured output) are all served by sequential
+  chains.
+- **Coordinator-required repairs that actually re-invoke the coordinator.**
+  The plan is recorded with reasoning; the regeneration pass isn't
+  wired. Would close the gap between "attempted repair" and "applied
+  repair" for `fix_tool_arguments` / `apply_graph_verified_chain_change`
+  / `regenerate_conversation`.
+- **Real-provider 100-sample judging in CI.** The E2E test uses a
+  deterministic fake judge. A real run is a manual smoke step.
+- **Endpoint-pair forbidding in the walker.** The pair counter is
+  recorded but the walker only forbids individual endpoints. Pair-level
+  steering would let the planner attack high-frequency transitions
+  directly.
+- **`--llm-mock-polish`.** Would have the executor's mock generator pass
+  string fields through an LLM for natural phrasing. Plumbing is there
+  in design; not implemented because the chain-critical path doesn't
+  need it.
+- **Full-ToolBench scale.** The fixture is 45 endpoints. Scaling would
+  need: a vetted canonical-name vocabulary, `endpoint_id` migration to
+  `domain/tool_name/name`, possibly indexed graph traversal, cached
+  embeddings. None of this is built; the design has hooks for it.
