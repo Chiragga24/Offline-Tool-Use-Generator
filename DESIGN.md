@@ -48,14 +48,14 @@ by default, with all LLM features behind opt-in flags.
 
 **Key result (steering on, seed 42, 100 conversations):**
 
-| | Run A (no steering) | Run B (steering) |
-|---|---:|---:|
-| endpoint coverage | 78% | 89% |
-| tool coverage | 89% | 100% |
-| domain entropy | 2.53 | 2.70 |
-| top-endpoint share | 22% | 19% |
-| mean deterministic score | 9.96 | 10.00 |
-| usable-for-training rate | 99% | 100% |
+|                          | Run A (no steering) | Run B (steering) |
+| ------------------------ | ------------------: | ---------------: |
+| endpoint coverage        |                 78% |              89% |
+| tool coverage            |                 89% |             100% |
+| domain entropy           |                2.53 |             2.70 |
+| top-endpoint share       |                 22% |              19% |
+| mean deterministic score |                9.96 |            10.00 |
+| usable-for-training rate |                 99% |             100% |
 
 Steering widens coverage without hurting quality. Full breakdown in #10.
 
@@ -67,18 +67,18 @@ keys are present and skip cleanly otherwise.
 
 ### Components
 
-| Module | Responsibility | Boundary |
-|---|---|---|
-| `registry/` | Tolerant ToolBench JSON → normalized Pydantic `ToolRegistry`. Deterministic field enrichment + optional LLM enrichment. | Reads raw JSON; writes `registry.json`. |
-| `graph/` | Builds typed `ToolGraph` from registry. `output_satisfies_input` grounding edges via alias-aware matching. Optional semantic expansion (local SentenceTransformer or Mem0). | Reads `ToolRegistry`; writes `tool_graph.json`. |
-| `sampler/` | `ToolChainSampler` does deterministic DFS with backtracking. `CorpusPlanner` distributes constraints across a corpus. `CorpusSteerer`/`NullSteerer` are the on/off variants. | Reads `ToolGraph`; emits `SamplingResult`s. |
-| `executor/` | `OfflineExecutor` opens per-conversation `ExecutorSession`. Validates args (Pydantic + strict grounding). Generates chain-consistent mock responses. | Driven turn-by-turn by the coordinator. |
-| `generator/` | Three stateless agents (`Planner`, `UserSimulator`, `Assistant`), each in deterministic and LLM variants behind the same Protocol. `ConversationCoordinator` owns the transcript. | Reads `SamplingResult`; writes `Conversation`. |
-| `evaluation/` | Deterministic metrics + optional `LLMJudge` (5 rubric dimensions). | Reads JSONL; writes metrics + scored JSONL. |
-| `repair/` | `RepairPolicy` detects triggers; deterministic or LLM planner proposes a `RepairPlan`; safe local repairs are applied. | Reads scored conversation; mutates a copy. |
-| `diversity/` | Runs the steering on/off experiment, computes metrics, writes report. | Wraps generator + evaluator. |
-| `schema/` | Pydantic artifact schemas for downstream filters. | Reusable by tests + downstream. |
-| `llm/` | `StructuredLLMClient` — provider-neutral JSON client (Gemini default, Groq backup, OpenAI-compatible, HF). | Used by enricher, judge, repair, generator. |
+| Module          | Responsibility                                                                                                                                                                            | Boundary                                            |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `registry/`   | Tolerant ToolBench JSON → normalized Pydantic `ToolRegistry`. Deterministic field enrichment + optional LLM enrichment.                                                                | Reads raw JSON; writes `registry.json`.           |
+| `graph/`      | Builds typed `ToolGraph` from registry. `output_satisfies_input` grounding edges via alias-aware matching. Optional semantic expansion (local SentenceTransformer or Mem0).           | Reads `ToolRegistry`; writes `tool_graph.json`. |
+| `sampler/`    | `ToolChainSampler` does deterministic DFS with backtracking. `CorpusPlanner` distributes constraints across a corpus. `CorpusSteerer`/`NullSteerer` are the on/off variants.      | Reads `ToolGraph`; emits `SamplingResult`s.     |
+| `executor/`   | `OfflineExecutor` opens per-conversation `ExecutorSession`. Validates args (Pydantic + strict grounding). Generates chain-consistent mock responses.                                  | Driven turn-by-turn by the coordinator.             |
+| `generator/`  | Three stateless agents (`Planner`, `UserSimulator`, `Assistant`), each in deterministic and LLM variants behind the same Protocol. `ConversationCoordinator` owns the transcript. | Reads `SamplingResult`; writes `Conversation`.  |
+| `evaluation/` | Deterministic metrics + optional `LLMJudge` (5 rubric dimensions).                                                                                                                      | Reads JSONL; writes metrics + scored JSONL.         |
+| `repair/`     | `RepairPolicy` detects triggers; deterministic or LLM planner proposes a `RepairPlan`; safe local repairs are applied.                                                                | Reads scored conversation; mutates a copy.          |
+| `diversity/`  | Runs the steering on/off experiment, computes metrics, writes report.                                                                                                                     | Wraps generator + evaluator.                        |
+| `schema/`     | Pydantic artifact schemas for downstream filters.                                                                                                                                         | Reusable by tests + downstream.                     |
+| `llm/`        | `StructuredLLMClient` — provider-neutral JSON client (Gemini default, Groq backup, OpenAI-compatible, HF).                                                                             | Used by enricher, judge, repair, generator.         |
 
 ### Communication flow inside one conversation
 
@@ -106,14 +106,14 @@ validator as `suggest_arguments`-derived ones — no privileged caller.
 
 ### Load-bearing system-level decisions
 
-| Decision | Why |
-|---|---|
-| **Deterministic-first, LLM opt-in throughout.** Every component has a deterministic path that satisfies the rubric; LLM features are toggles. | CI runs offline. Reviewers without credentials get a working pipeline. LLM features become realism boosters, not crash points. |
-| **Provider-neutral LLM client** with 10 hosted/local providers behind one `complete_json(system, user)` adapter. | An earlier HF-only path hit a provider billing wall mid-test. One client lets `.env` swap providers without touching agent code. See provider table at the end of #2. |
-| **Pydantic at every boundary** (registry, graph artifact, sampler result, executor errors, agent turns, judge scores, repair plans, dataset records). | One validation system; no schema drift between in-memory and on-disk; the assignment's structured-output requirement is satisfied by construction. |
-| **Per-chain RNG seed derived as `planner_seed*1_000_003 + plan_index`**, not threaded through a single RNG. | Steering on/off must not perturb each chain's individual RNG state — otherwise Run A and Run B aren't directly comparable at the per-chain level. |
-| **JSON-serializable graph, not Neo4j**; in-memory state, not a vector DB (Mem0 is opt-in). | Reviewer setup is `pip install`. The graph artifact is grep-able. |
-| **Strict grounding everywhere, errors inline in conversation log.** | The rubric's "coherent chaining" property is enforced at execution, not by the prompt. Failures surface as `role: "tool"` error entries so reviewers see the repair flow inline. |
+| Decision                                                                                                                                                    | Why                                                                                                                                                                                |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Deterministic-first, LLM opt-in throughout.** Every component has a deterministic path that satisfies the rubric; LLM features are toggles.         | CI runs offline. Reviewers without credentials get a working pipeline. LLM features become realism boosters, not crash points.                                                     |
+| **Provider-neutral LLM client** with 10 hosted/local providers behind one `complete_json(system, user)` adapter.                                    | An earlier HF-only path hit a provider billing wall mid-test. One client lets `.env` swap providers without touching agent code. See provider table at the end of #2.            |
+| **Pydantic at every boundary** (registry, graph artifact, sampler result, executor errors, agent turns, judge scores, repair plans, dataset records). | One validation system; no schema drift between in-memory and on-disk; the assignment's structured-output requirement is satisfied by construction.                                 |
+| **Per-chain RNG seed derived as `planner_seed*1_000_003 + plan_index`**, not threaded through a single RNG.                                         | Steering on/off must not perturb each chain's individual RNG state — otherwise Run A and Run B aren't directly comparable at the per-chain level.                                 |
+| **JSON-serializable graph, not Neo4j**; in-memory state, not a vector DB (Mem0 is opt-in).                                                            | Reviewer setup is `pip install`. The graph artifact is grep-able.                                                                                                                |
+| **Strict grounding everywhere, errors inline in conversation log.**                                                                                   | The rubric's "coherent chaining" property is enforced at execution, not by the prompt. Failures surface as `role: "tool"` error entries so reviewers see the repair flow inline. |
 
 ### What I'm uncertain about at the system level
 
@@ -134,20 +134,20 @@ validator as `suggest_arguments`-derived ones — no privileged caller.
 adapter. Any of these can be selected via `KG_MLE_LLM_PROVIDER` in
 `.env`; the matching API key is read from the env var below.
 
-| Provider | API shape | Default model | Env var | Default base URL |
-|---|---|---|---|---|
-| **Gemini** *(default)* | Native `generateContent` with `responseMimeType=application/json` | `gemini-2.0-flash-lite-001` | `GOOGLE_API_KEY` | hardcoded |
-| **Anthropic** | Native Messages API, JSON via prefilled `{` | `claude-3-5-haiku-latest` | `ANTHROPIC_API_KEY` | `api.anthropic.com` |
-| **Groq** | OpenAI-compatible `chat/completions` | `llama-3.1-8b-instant` | `GROQ_API_KEY` | `api.groq.com/openai/v1` |
-| **OpenAI** | OpenAI-compatible | `gpt-4.1-mini` | `OPENAI_API_KEY` | `api.openai.com/v1` |
-| **DeepSeek** | OpenAI-compatible | `deepseek-chat` | `DEEPSEEK_API_KEY` | `api.deepseek.com/v1` |
-| **Qwen (DashScope)** | OpenAI-compatible | `qwen-plus` | `DASHSCOPE_API_KEY` | DashScope compatible-mode |
-| **Together AI** | OpenAI-compatible | `google/gemma-2-9b-it` | `TOGETHER_API_KEY` | `api.together.xyz/v1` |
-| **xAI (Grok)** | OpenAI-compatible | `grok-3-mini` | `XAI_API_KEY` | `api.x.ai/v1` |
-| **Hugging Face** | `huggingface_hub.InferenceClient` | `google/gemma-4-E2B-it` | `HF_TOKEN` | router |
-| **Ollama** *(local)* | OpenAI-compatible, no key | `gemma4` | — | `localhost:11434/v1` |
-| **LM Studio** *(local)* | OpenAI-compatible, no key | `local-model` | — | `KG_MLE_LLM_BASE_URL` |
-| **vLLM** *(local)* | OpenAI-compatible, no key | `google/gemma-4-E2B-it` | — | `KG_MLE_LLM_BASE_URL` |
+| Provider                        | API shape                                                             | Default model                 | Env var               | Default base URL           |
+| ------------------------------- | --------------------------------------------------------------------- | ----------------------------- | --------------------- | -------------------------- |
+| **Gemini** *(default)*  | Native `generateContent` with `responseMimeType=application/json` | `gemini-2.0-flash-lite-001` | `GOOGLE_API_KEY`    | hardcoded                  |
+| **Anthropic**             | Native Messages API, JSON via prefilled `{`                         | `claude-3-5-haiku-latest`   | `ANTHROPIC_API_KEY` | `api.anthropic.com`      |
+| **Groq**                  | OpenAI-compatible `chat/completions`                                | `llama-3.1-8b-instant`      | `GROQ_API_KEY`      | `api.groq.com/openai/v1` |
+| **OpenAI**                | OpenAI-compatible                                                     | `gpt-4.1-mini`              | `OPENAI_API_KEY`    | `api.openai.com/v1`      |
+| **DeepSeek**              | OpenAI-compatible                                                     | `deepseek-chat`             | `DEEPSEEK_API_KEY`  | `api.deepseek.com/v1`    |
+| **Qwen (DashScope)**      | OpenAI-compatible                                                     | `qwen-plus`                 | `DASHSCOPE_API_KEY` | DashScope compatible-mode  |
+| **Together AI**           | OpenAI-compatible                                                     | `google/gemma-2-9b-it`      | `TOGETHER_API_KEY`  | `api.together.xyz/v1`    |
+| **xAI (Grok)**            | OpenAI-compatible                                                     | `grok-3-mini`               | `XAI_API_KEY`       | `api.x.ai/v1`            |
+| **Hugging Face**          | `huggingface_hub.InferenceClient`                                   | `google/gemma-4-E2B-it`     | `HF_TOKEN`          | router                     |
+| **Ollama** *(local)*    | OpenAI-compatible, no key                                             | `gemma4`                    | —                    | `localhost:11434/v1`     |
+| **LM Studio** *(local)* | OpenAI-compatible, no key                                             | `local-model`               | —                    | `KG_MLE_LLM_BASE_URL`    |
+| **vLLM** *(local)*      | OpenAI-compatible, no key                                             | `google/gemma-4-E2B-it`     | —                    | `KG_MLE_LLM_BASE_URL`    |
 
 Any other OpenAI-compatible API can be added without code changes by
 setting `KG_MLE_LLM_PROVIDER=openai` (or any of the OpenAI-compatible
@@ -222,11 +222,11 @@ suggestions below threshold or for missing fields are rejected; original
 field names are never removed (they remain the actual call arguments).
 This is what the graph's grounding logic reads — see #4.
 
-| Decision | Alternative | Why |
-|---|---|---|
-| Tolerant normalization (preserve incomplete endpoints) | Strict validation that rejects | ToolBench data is inconsistent; rejecting kills coverage. |
-| Pydantic types throughout | Pass raw dicts downstream | Centralising parsing keeps every later module simpler. |
-| LLM enrichment is structured-output + whitelist | Free-text LLM output | A bad LLM canonical name would silently miswire the graph. |
+| Decision                                               | Alternative                    | Why                                                        |
+| ------------------------------------------------------ | ------------------------------ | ---------------------------------------------------------- |
+| Tolerant normalization (preserve incomplete endpoints) | Strict validation that rejects | ToolBench data is inconsistent; rejecting kills coverage.  |
+| Pydantic types throughout                              | Pass raw dicts downstream      | Centralising parsing keeps every later module simpler.     |
+| LLM enrichment is structured-output + whitelist        | Free-text LLM output           | A bad LLM canonical name would silently miswire the graph. |
 
 LLM enrichment failures are contained: `enrich_registry` catches any
 enricher exception (provider quota/outage, malformed response), records
@@ -290,11 +290,11 @@ semantic links. Lower admitted too much noise; higher was too sparse.
 This is tuned to the specific MiniLM model — a different embedding
 model would need re-tuning.
 
-| Decision | Alternative | Why |
-|---|---|---|
-| JSON artifact, not Neo4j | External graph DB | Sampler only needs adjacency; reviewers shouldn't run services. |
-| `output_satisfies_input` is the strongest edge | Treat all edge types equally during sampling | Direct support for "coherent chaining" rubric property. |
-| Semantic edges are opt-in, never override deterministic edges | Always-on semantic expansion | Cosine similarity ≠ proof that output satisfies input. |
+| Decision                                                      | Alternative                                  | Why                                                             |
+| ------------------------------------------------------------- | -------------------------------------------- | --------------------------------------------------------------- |
+| JSON artifact, not Neo4j                                      | External graph DB                            | Sampler only needs adjacency; reviewers shouldn't run services. |
+| `output_satisfies_input` is the strongest edge              | Treat all edge types equally during sampling | Direct support for "coherent chaining" rubric property.         |
+| Semantic edges are opt-in, never override deterministic edges | Always-on semantic expansion                 | Cosine similarity ≠ proof that output satisfies input.         |
 
 **Current verification** (deterministic, no semantic):
 
@@ -343,12 +343,12 @@ Varied length is `n_steps=(min, max)`. Coherent chaining is
 `min_grounded_transitions`. Steering hooks are `forbid_endpoint_ids`
 and a recommended `required_domains[0]` from the steerer.
 
-| Decision | Alternative | Why |
-|---|---|---|
-| DFS + backtracking | Bidirectional BFS / shortest path | Every chain in the search space is interesting; constraints are checked at terminal, not en route. |
-| Tiered edge preference | Single edge pool with terminal filter | Biases search toward groundable chains by construction. |
-| Per-tier seeded shuffle, deterministic tie-break | Pure deterministic ordering | Pure determinism → same chain every seed, defeats sampling. |
-| Terminal-only constraint check (with grounded-feasibility prune) | Full branch-and-bound | Marginal speedup at fixture scale; readability wins. |
+| Decision                                                         | Alternative                           | Why                                                                                                |
+| ---------------------------------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| DFS + backtracking                                               | Bidirectional BFS / shortest path     | Every chain in the search space is interesting; constraints are checked at terminal, not en route. |
+| Tiered edge preference                                           | Single edge pool with terminal filter | Biases search toward groundable chains by construction.                                            |
+| Per-tier seeded shuffle, deterministic tie-break                 | Pure deterministic ordering           | Pure determinism → same chain every seed, defeats sampling.                                       |
+| Terminal-only constraint check (with grounded-feasibility prune) | Full branch-and-bound                 | Marginal speedup at fixture scale; readability wins.                                               |
 
 **Fixture observation.** Probe over 50 seeds:
 
@@ -387,12 +387,12 @@ comparable on the same metrics); only the steerer returns forbid lists
 and least-used domain hints. The hard-exclusion threshold has a floor
 of 3 so small corpora don't run out of usable endpoints.
 
-| Decision | Alternative | Why |
-|---|---|---|
+| Decision                                                 | Alternative                           | Why                                                                       |
+| -------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------- |
 | Hybrid steering: hard exclusion + soft domain preference | Probability-based softmax reweighting | Uses only constraints the walker already exposes; clean layer separation. |
-| Per-chain seed `planner_seed*1_000_003 + plan_index` | Thread a single RNG | Steering on/off must not shift each chain's individual RNG state. |
-| `NullSteerer` still records counters | Skip counters when steering off | Run A vs Run B needs comparable stats on both sides. |
-| Relaxation ladder gives up steering before the chain | Drop unsatisfiable chains | Steering is meant to widen coverage, not lose conversations. |
+| Per-chain seed `planner_seed*1_000_003 + plan_index`   | Thread a single RNG                   | Steering on/off must not shift each chain's individual RNG state.         |
+| `NullSteerer` still records counters                   | Skip counters when steering off       | Run A vs Run B needs comparable stats on both sides.                      |
+| Relaxation ladder gives up steering before the chain     | Drop unsatisfiable chains             | Steering is meant to widen coverage, not lose conversations.              |
 
 ### Honest gaps
 
@@ -463,13 +463,13 @@ handles the enriched-alias case.
 A reviewer sees the rejection, the repair, and the recovery without
 consulting an external log.
 
-| Decision | Alternative | Why |
-|---|---|---|
-| Deterministic mocks; LLM polish opt-in | LLM-generated responses by default | Chain-critical fields must be byte-stable for reproducibility. |
-| Stateful session, generator-driven | Batch `run_chain` | The generator interleaves clarifications and user replies between tool calls. |
-| Executor owns `suggest_arguments` + `example_values` | Generator re-derives defaults | The executor already owns schema + canonical pool + issued-values index. |
-| Failures raise typed errors AND appear inline as `role: tool` entries | Toggle between modes | One needs control flow; the other needs reviewer visibility. Both at once. |
-| Strict grounding on all grounded params, ID or not | Only enforce on `*_id` | Sampler's grounded transitions describe an output→input promise at the field-name level. |
+| Decision                                                                | Alternative                        | Why                                                                                       |
+| ----------------------------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------- |
+| Deterministic mocks; LLM polish opt-in                                  | LLM-generated responses by default | Chain-critical fields must be byte-stable for reproducibility.                            |
+| Stateful session, generator-driven                                      | Batch `run_chain`                | The generator interleaves clarifications and user replies between tool calls.             |
+| Executor owns `suggest_arguments` + `example_values`                | Generator re-derives defaults      | The executor already owns schema + canonical pool + issued-values index.                  |
+| Failures raise typed errors AND appear inline as `role: tool` entries | Toggle between modes               | One needs control flow; the other needs reviewer visibility. Both at once.                |
+| Strict grounding on all grounded params, ID or not                      | Only enforce on `*_id`           | Sampler's grounded transitions describe an output→input promise at the field-name level. |
 
 ### Honest gaps
 
@@ -552,33 +552,35 @@ JSON, Pydantic validation error, plan/chain shape mismatch). The
 fallback records `last_run = {"path": "fallback", "reason": "..."}`,
 which the coordinator includes in metadata so the judge and downstream
 analysis can see which conversations were LLM-driven. The `generate`
-and `diversity` commands both route through these agents under
-`--use-llm`; without it (the default and the reproducible baseline)
-they use the deterministic agents. See #12 for the diversity
-reproducibility tradeoff.
+command routes through these agents under `--use-llm`; without it (the
+default and the reproducible baseline) it uses the deterministic
+agents. `diversity` also routes both runs through the same LLM-backed
+generator stack under `--use-llm`; the seed and sampler policy stay the
+same so Run A / Run B still isolate steering rather than a different
+corpus recipe. See #12 for that reproducibility tradeoff.
 
 ### LLM failure modes
 
-| Failure | What happens |
-|---|---|
-| Provider 4xx/5xx / network exception | Immediate fallback to deterministic agent. |
-| Malformed JSON (no `{...}` found) | One retry with error context prepended. If still malformed → fallback. |
-| Schema mismatch (Pydantic `ValidationError`) | One retry with error context. If still invalid → fallback. |
-| Plan endpoint mismatch / wrong step count | One retry. If still wrong → fallback. |
-| Executor rejects an LLM-emitted tool call | One repair attempt invokes the assistant again with the failure in the transcript. If that fails → conversation closes with the failure visible inline. |
+| Failure                                        | What happens                                                                                                                                             |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Provider 4xx/5xx / network exception           | Immediate fallback to deterministic agent.                                                                                                               |
+| Malformed JSON (no `{...}` found)            | One retry with error context prepended. If still malformed → fallback.                                                                                  |
+| Schema mismatch (Pydantic `ValidationError`) | One retry with error context. If still invalid → fallback.                                                                                              |
+| Plan endpoint mismatch / wrong step count      | One retry. If still wrong → fallback.                                                                                                                   |
+| Executor rejects an LLM-emitted tool call      | One repair attempt invokes the assistant again with the failure in the transcript. If that fails → conversation closes with the failure visible inline. |
 
 The coordinator never crashes on LLM behaviour. The worst case is a
 deterministic conversation with metadata noting why the LLM path was
 abandoned.
 
-| Decision | Alternative | Why |
-|---|---|---|
-| Three-agent decomposition (Planner / User / Assistant) | Four agents with a separate Final-Writer | The closing summary belongs to the same agent that emitted tool calls. |
-| Structured output on **both** Planner and Assistant | Just the Assistant | Planner's `ambiguous_step_indices` and per-param confidences need structured shape for the disambiguation gate to be deterministic. Two structured agents also doubles the rubric evidence. |
-| Planner-primary disambiguation + confidence-gated assistant initiative | Pure planner-driven | The planner can be wrong; the assistant gets per-param confidence and can ask when planner is unsure. |
-| Chain-bound termination + graph-verified `ChainDeviation` | Free assistant termination / extension | Free deviation would compete with the planner's length-distribution targets. The gates keep deviations exceptional. |
-| Deterministic agents by default; LLM agents wrap them as fallback | LLM-required | Missing API key, provider 402, persistently-malformed JSON → conversation still completes. |
-| Stateless agents; coordinator owns the transcript; typed Pydantic handoff | Agents read the natural-language transcript directly | Typed handoff prevents one agent's prompt wording from confusing another. |
+| Decision                                                                  | Alternative                                          | Why                                                                                                                                                                                           |
+| ------------------------------------------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Three-agent decomposition (Planner / User / Assistant)                    | Four agents with a separate Final-Writer             | The closing summary belongs to the same agent that emitted tool calls.                                                                                                                        |
+| Structured output on**both** Planner and Assistant                  | Just the Assistant                                   | Planner's `ambiguous_step_indices` and per-param confidences need structured shape for the disambiguation gate to be deterministic. Two structured agents also doubles the rubric evidence. |
+| Planner-primary disambiguation + confidence-gated assistant initiative    | Pure planner-driven                                  | The planner can be wrong; the assistant gets per-param confidence and can ask when planner is unsure.                                                                                         |
+| Chain-bound termination + graph-verified `ChainDeviation`               | Free assistant termination / extension               | Free deviation would compete with the planner's length-distribution targets. The gates keep deviations exceptional.                                                                           |
+| Deterministic agents by default; LLM agents wrap them as fallback         | LLM-required                                         | Missing API key, provider 402, persistently-malformed JSON → conversation still completes.                                                                                                   |
+| Stateless agents; coordinator owns the transcript; typed Pydantic handoff | Agents read the natural-language transcript directly | Typed handoff prevents one agent's prompt wording from confusing another.                                                                                                                     |
 
 ### Honest gaps
 
@@ -629,15 +631,15 @@ deterministic_score       mean of the above × 10
 
 ### LLM judge dimensions (0–10 each, plus issues + rationale)
 
-| Dimension | What it measures |
-|---|---|
-| `task_completion` | Does the final assistant message satisfy the user's stated request? |
-| `tool_trace_validity` | Are tools selected, sequenced, and responded to coherently? |
-| `argument_grounding` | Do tool-call arguments come from user input, plan values, or prior tool outputs? |
-| `response_grounding` | Does the final answer stay faithful to actual tool outputs? |
-| `naturalness` | Does the dialogue read like a plausible human exchange? |
-| `overall_score` | Holistic — severe trace failures can dominate. |
-| `confidence` | Judge's own confidence in its score. |
+| Dimension               | What it measures                                                                 |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| `task_completion`     | Does the final assistant message satisfy the user's stated request?              |
+| `tool_trace_validity` | Are tools selected, sequenced, and responded to coherently?                      |
+| `argument_grounding`  | Do tool-call arguments come from user input, plan values, or prior tool outputs? |
+| `response_grounding`  | Does the final answer stay faithful to actual tool outputs?                      |
+| `naturalness`         | Does the dialogue read like a plausible human exchange?                          |
+| `overall_score`       | Holistic — severe trace failures can dominate.                                  |
+| `confidence`          | Judge's own confidence in its score.                                             |
 
 The dimensions intentionally separate **trace correctness**
 (`tool_trace_validity`, `argument_grounding`) from **answer quality**
@@ -645,12 +647,12 @@ The dimensions intentionally separate **trace correctness**
 can have natural wording but a bad tool trace, or a valid trace but a
 hallucinated final answer; both should be visible to filtering.
 
-| Decision | Alternative | Why |
-|---|---|---|
-| Two-layer evaluation (deterministic always, LLM optional) | LLM-only | CI runs offline; deterministic metrics are reproducible. |
-| 5 rubric dimensions (>3 required) | Generic helpfulness/fluency | Generic metrics miss invalid tool calls that "sound natural." |
-| Separate `argument_grounding` and `response_grounding` | One "grounding" score | Different failure modes need different filters. |
-| 0–10 quality scores; 0–1 coverage ratios | One uniform scale | Quality is a human-readable rubric; coverage is a fraction. |
+| Decision                                                                           | Alternative                   | Why                                                                        |
+| ---------------------------------------------------------------------------------- | ----------------------------- | -------------------------------------------------------------------------- |
+| Two-layer evaluation (deterministic always, LLM optional)                          | LLM-only                      | CI runs offline; deterministic metrics are reproducible.                   |
+| 5 rubric dimensions (>3 required)                                                  | Generic helpfulness/fluency   | Generic metrics miss invalid tool calls that "sound natural."              |
+| Separate `argument_grounding` and `response_grounding`                         | One "grounding" score         | Different failure modes need different filters.                            |
+| 0–10 quality scores; 0–1 coverage ratios                                         | One uniform scale             | Quality is a human-readable rubric; coverage is a fraction.                |
 | Treat provider failures as record-level `llm_judge.error`, not pipeline failures | Crash on first provider error | Hosted inference is optional; the deterministic eval shouldn't be blocked. |
 
 ### Quality bands (in `metadata.evaluation`)
@@ -711,24 +713,14 @@ naturalness              < 5.0
 
 ### Strategies and what actually applies
 
-| Strategy | Applied by | Status |
-|---|---|---|
-| `rewrite_final_response` | Deterministic planner | Applied in place. Composes a grounded summary from existing tool outputs. |
-| `mark_rejected` | Deterministic planner | Recorded; conversation kept for analysis. |
-| `apply_graph_verified_chain_change` | Coordinator | Plan recorded; status `failed` in the evaluator pass because the evaluator doesn't re-run the coordinator. |
-| `regenerate_conversation` | Coordinator | Plan recorded; status `failed` in the evaluator pass. |
-| `fix_tool_arguments` | Coordinator | Plan recorded; same reason. |
-| `insert_clarification` | Coordinator | Plan recorded; same reason. |
-
-This is the honest reading: the post-evaluation pass can only safely
-do final-response rewrites in place. The four coordinator-required
-strategies are recorded with reasoning so the trail is visible, but the
-evaluator doesn't try to mutate state it doesn't have access to. The
-PDF asks the system to "attempt to repair … rather than simply discard
-it"; recording a planned-but-failed repair satisfies that intent
-honestly. A future regenerator pass that re-invokes the coordinator
-from the evaluate command would close this — it's not in the submitted
-build.
+| Strategy                              | Applied by            | Status                                                                                                       |
+| ------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `rewrite_final_response`            | Deterministic planner | Applied in place. Composes a grounded summary from existing tool outputs.                                    |
+| `mark_rejected`                     | Deterministic planner | Recorded; conversation kept for analysis.                                                                    |
+| `apply_graph_verified_chain_change` | Coordinator           | Plan recorded; status `failed` in the evaluator pass because the evaluator doesn't re-run the coordinator. |
+| `regenerate_conversation`           | Coordinator           | Plan recorded; status `failed` in the evaluator pass.                                                      |
+| `fix_tool_arguments`                | Coordinator           | Plan recorded; same reason.                                                                                  |
+| `insert_clarification`              | Coordinator           | Plan recorded; same reason.                                                                                  |
 
 ### LLM repair planner
 
@@ -737,12 +729,12 @@ proposes a `RepairPlan` (same Pydantic schema), but application still
 goes through the deterministic apply layer — hosted output never
 directly mutates a conversation.
 
-| Decision | Alternative | Why |
-|---|---|---|
-| Repair module owns policy + planning; coordinator owns stateful application | Single module that does both | The evaluator runs on serialized conversations; only the coordinator has live executor state. |
-| Fixed budget of one repair attempt | Unbounded retry | Bounds cost; demonstrates the loop without dominating the run. |
-| Chain-changing repairs are graph-verified | Free-form chain edits | Mutating chains without graph proof would create new hallucination risk. |
-| LLM repair plans are advisory; apply stays deterministic | LLM rewrites the conversation directly | Validation pipeline stays single-path; LLM output is constrained to the `RepairPlan` schema. |
+| Decision                                                                    | Alternative                            | Why                                                                                            |
+| --------------------------------------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Repair module owns policy + planning; coordinator owns stateful application | Single module that does both           | The evaluator runs on serialized conversations; only the coordinator has live executor state.  |
+| Fixed budget of one repair attempt                                          | Unbounded retry                        | Bounds cost; demonstrates the loop without dominating the run.                                 |
+| Chain-changing repairs are graph-verified                                   | Free-form chain edits                  | Mutating chains without graph proof would create new hallucination risk.                       |
+| LLM repair plans are advisory; apply stays deterministic                    | LLM rewrites the conversation directly | Validation pipeline stays single-path; LLM output is constrained to the `RepairPlan` schema. |
 
 ### Honest gap
 
@@ -803,18 +795,18 @@ kgmle diversity --count 100 --seed 42 --output-dir artifacts/diversity
 Two runs with the same seed/count/fixture, only the steering flag
 differs. Six diversity metrics + four quality metrics:
 
-| Metric | Run A: no steering | Run B: steering | Δ |
-|---|---:|---:|---:|
-| domain entropy | 2.5304 | 2.7039 | **+0.1735** |
-| endpoint coverage ratio | 0.7778 | 0.8889 | **+0.1111** |
-| tool coverage ratio | 0.8889 | 1.0000 | **+0.1111** |
-| distinct endpoint-pair ratio | 0.3125 | 0.3042 | −0.0083 |
-| domain pattern diversity | 12 | 13 | +1 |
-| top endpoint share | 0.2235 | 0.1912 | **−0.0323** |
-| mean deterministic score | 9.9600 | 10.0000 | +0.0400 |
-| chain completion | 0.9900 | 1.0000 | +0.0100 |
-| schema valid rate | 1.0000 | 1.0000 | 0.0000 |
-| usable-for-training rate | 0.9900 | 1.0000 | +0.0100 |
+| Metric                       | Run A: no steering | Run B: steering |                 Δ |
+| ---------------------------- | -----------------: | --------------: | -----------------: |
+| domain entropy               |             2.5304 |          2.7039 |  **+0.1735** |
+| endpoint coverage ratio      |             0.7778 |          0.8889 |  **+0.1111** |
+| tool coverage ratio          |             0.8889 |          1.0000 |  **+0.1111** |
+| distinct endpoint-pair ratio |             0.3125 |          0.3042 |           −0.0083 |
+| domain pattern diversity     |                 12 |              13 |                 +1 |
+| top endpoint share           |             0.2235 |          0.1912 | **−0.0323** |
+| mean deterministic score     |             9.9600 |         10.0000 |            +0.0400 |
+| chain completion             |             0.9900 |          1.0000 |            +0.0100 |
+| schema valid rate            |             1.0000 |          1.0000 |             0.0000 |
+| usable-for-training rate     |             0.9900 |          1.0000 |            +0.0100 |
 
 **Interpretation.**
 
@@ -831,12 +823,12 @@ differs. Six diversity metrics + four quality metrics:
 - **Quality did not degrade.** The steered run hit perfect deterministic
   score, schema validity, and chain completion.
 
-| Decision | Alternative | Why |
-|---|---|---|
-| Counter-based steering; not semantic memory | Persistent vector memory | Counters are deterministic, inspectable, directly tied to the metrics; vector memory is overkill for a 100-sample corpus. |
-| Both runs use the same seed/count/fixture | Different seeds per run | The experiment must isolate steering's effect. |
-| Six metrics + quality | Single "diversity score" | Steering can improve some metrics and hurt others; the comparison should expose that. |
-| Transparent metrics (counts, entropy, ratios) | Embedding-distance diversity | Tied directly to graph/sampler behavior; reproducible without an embedding model. |
+| Decision                                      | Alternative                  | Why                                                                                                                       |
+| --------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Counter-based steering; not semantic memory   | Persistent vector memory     | Counters are deterministic, inspectable, directly tied to the metrics; vector memory is overkill for a 100-sample corpus. |
+| Both runs use the same seed/count/fixture     | Different seeds per run      | The experiment must isolate steering's effect.                                                                            |
+| Six metrics + quality                         | Single "diversity score"     | Steering can improve some metrics and hurt others; the comparison should expose that.                                     |
+| Transparent metrics (counts, entropy, ratios) | Embedding-distance diversity | Tied directly to graph/sampler behavior; reproducible without an embedding model.                                         |
 
 ### Honest gaps
 
@@ -976,11 +968,11 @@ the deterministic metrics, quality band, usable-for-training flag, and
 optional `llm_judge` result (or `{"error": "..."}` on provider
 failure).
 
-| Decision | Alternative | Why |
-|---|---|---|
-| Pydantic as the schema source of truth | Separate JSON Schema file | Avoids drift between in-memory and on-disk; reuses the same validators code already uses. |
-| Top-level conversation shape strict; metadata extensible (`extra="allow"`) | Strict everywhere | Metadata evolves (steering details, repair history, LLM paths); record shape shouldn't. |
-| LLM judge failures preserved as `{"error": "..."}` | Drop the field on failure | Reviewer needs to know the judge failed — and which records were affected. |
+| Decision                                                                     | Alternative               | Why                                                                                       |
+| ---------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------- |
+| Pydantic as the schema source of truth                                       | Separate JSON Schema file | Avoids drift between in-memory and on-disk; reuses the same validators code already uses. |
+| Top-level conversation shape strict; metadata extensible (`extra="allow"`) | Strict everywhere         | Metadata evolves (steering details, repair history, LLM paths); record shape shouldn't.   |
+| LLM judge failures preserved as `{"error": "..."}`                         | Drop the field on failure | Reviewer needs to know the judge failed — and which records were affected.               |
 
 ### CLI surface
 
@@ -1001,12 +993,12 @@ kgmle diversity   --count N --seed S --output-dir ...
 Global `--use-llm` is a single switch that turns on hosted features
 across commands consistently:
 
-| Command | Effect of `--use-llm` |
-|---|---|
-| `build` | Enables structured-output registry enrichment + semantic graph. |
-| `generate` | Loads built artifacts; uses LLM agents (with deterministic fallback per turn); enables semantic-edge traversal. |
-| `evaluate` | Enables LLM judge; if `--repair` set, also enables LLM repair planner. |
-| `diversity` | Enables registry enrichment, semantic graph, semantic-edge traversal, LLM judging, **and LLM generator agents for both runs** (with deterministic fallback per turn). One `StructuredLLMClient` serves all three LLM features. |
+| Command       | Effect of `--use-llm`                                                                                                                                                                                                               |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `build`     | Enables structured-output registry enrichment + semantic graph.                                                                                                                                                                       |
+| `generate`  | Loads built artifacts; uses LLM agents (with deterministic fallback per turn); enables semantic-edge traversal.                                                                                                                       |
+| `evaluate`  | Enables LLM judge; if `--repair` set, also enables LLM repair planner.                                                                                                                                                              |
+| `diversity` | Enables registry enrichment, semantic graph, semantic-edge traversal, LLM judging,**and LLM generator agents for both runs** (with deterministic fallback per turn). One `StructuredLLMClient` serves all three LLM features. |
 
 Individual legacy flags (`--llm-judge`, `--llm-enrich-registry`) are
 preserved for targeted runs.
