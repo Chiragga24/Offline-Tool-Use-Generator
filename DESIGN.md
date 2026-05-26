@@ -1956,7 +1956,253 @@ chains without graph validation would create new hallucination risk. The
 planner records graph-verified-chain-change as the appropriate strategy,
 but the evaluator does not mutate chains directly.
 
-## 16. Open Design Areas
+## 16. Context Management
+
+Context is managed at two levels:
+
+```text
+within-conversation context
+cross-conversation corpus context
+```
+
+The two serve different purposes. Within-conversation context keeps one tool
+trace grounded. Cross-conversation context makes the generated corpus diverse.
+
+### Within-Conversation Context
+
+Within one conversation, `ExecutorSession` and `SessionState` are the source
+of truth.
+
+They track:
+
+- successful tool calls
+- failed tool calls
+- tool responses
+- issued IDs
+- issued string fields
+- canonical field aliases
+- chronological tool log
+
+The generator accesses this state through narrow APIs:
+
+```python
+session.suggest_arguments(endpoint_id)
+session.example_values(endpoint_id)
+session.call(endpoint_id, arguments)
+```
+
+Design decision:
+
+- Keep runtime context in executor state, not only in prompt text.
+
+Reason:
+
+- Grounding must be machine-checkable. A prompt can suggest prior values, but
+  the executor state can prove whether a value was actually returned by an
+  earlier tool.
+
+### Grounding And Canonical Aliases
+
+When a tool returns a string field, the session registers it under both the
+literal field name and the canonical name when present.
+
+Example:
+
+```text
+food/check_availability returns available_time
+available_time canonical_name = start_time
+events/create_calendar_event requires start_time
+```
+
+The session stores the returned value under:
+
+```text
+available_time
+start_time
+```
+
+This lets a later `start_time` parameter use the previous
+`available_time` output without inventing a new value.
+
+Design decision:
+
+- Strict grounding applies to all grounded parameters, not only ID-shaped
+  parameters.
+
+Reason:
+
+- ToolBench-style chains can ground non-ID values such as `symbol`, `city`,
+  `date`, and `start_time`. If the assistant invents one of those values
+  instead of using the previous output, the trace should fail.
+
+### LLM Prompt Context
+
+LLM agents receive compact structured context:
+
+- plan
+- transcript so far
+- current step
+- suggested arguments
+- example values
+- relevant thresholds
+
+Design decision:
+
+- Pass structured context instead of large unbounded memory dumps.
+
+Reason:
+
+- It reduces hallucination surface area, lowers token cost, and makes LLM
+  outputs easier to validate through Pydantic.
+
+### Cross-Conversation Context
+
+Cross-conversation context is corpus-level statistical memory, implemented by
+`CorpusSteerer` and `CorpusCounters`.
+
+It tracks:
+
+- domain counts
+- tool counts
+- endpoint counts
+- endpoint-pair counts
+- chain length counts
+- domain-pattern counts
+
+Flow:
+
+```text
+sample conversation N
+-> record domains/tools/endpoints/pairs
+-> update corpus counters
+-> shape constraints for conversation N+1
+```
+
+This context answers:
+
+```text
+What kind of chain should we sample next to improve corpus diversity?
+```
+
+It does not answer:
+
+```text
+What argument value should this tool call use?
+```
+
+That second question belongs to within-conversation executor state.
+
+Design decision:
+
+- Use statistical counters, not long-term semantic memory, for
+  cross-conversation steering.
+
+Reason:
+
+- The assignment needs diversity control and a steering-on/off experiment.
+  Counters are deterministic, inspectable, cheap, and directly tied to the
+  diversity metrics. Persistent user memory would add privacy and complexity
+  without improving the required tool-use dataset.
+
+### Steering And Relaxation
+
+The corpus planner can use cross-conversation counters to:
+
+- prefer underused domains
+- forbid overused endpoints
+- diagnose overused endpoint pairs
+- vary chain length and domain patterns
+
+If steering over-constrains sampling, the planner relaxes constraints rather
+than dropping the record.
+
+Relaxation order:
+
+1. reduce grounded-transition requirement
+2. remove required domains
+3. reduce distinct-domain requirement
+4. stop forbidding overused endpoints
+5. reduce distinct-tool requirement
+6. reduce chain length only as a last resort
+
+Design decision:
+
+- Relax steering before failing generation.
+
+Reason:
+
+- A valid slightly less-diverse conversation is better than silently losing a
+  record, especially in a fixed-size corpus.
+
+### Mem0 And Semantic Context
+
+Mem0 is used only for optional semantic graph expansion, not as runtime user
+memory.
+
+Endpoint cards are added with `infer=False`.
+
+Design decision:
+
+- Do not let Mem0's LLM memory extraction rewrite endpoint cards.
+
+Reason:
+
+- Endpoint cards are already structured schema facts. LLM rewriting would add
+  cost, latency, nondeterminism, and the risk of dropping parameter names.
+
+### Repair Context
+
+Inline repair during generation can use live executor context. Post-generation
+repair has only the serialized conversation, metrics, and tool outputs.
+
+Design decision:
+
+- Post-generation repair applies only safe local edits directly. Repairs that
+  need executor state, graph mutation, or chain regeneration are planned and
+  recorded as coordinator-required.
+
+Reason:
+
+- The evaluator should not pretend it can safely mutate a stateful trace after
+  the session has ended.
+
+### Context Management Limitations And Scale Tradeoffs
+
+Limitations:
+
+- Cross-conversation steering is counter-based, so it cannot understand deep
+  semantic novelty by itself.
+- Endpoint-pair overuse is recorded and surfaced for diagnostics, but the
+  current walker does not yet support direct pair-level forbidding.
+- Within-conversation context is per-session only; no user preferences persist
+  across conversations.
+- Post-generation repair cannot reconstruct full executor state unless the
+  coordinator is rerun.
+
+Scale tradeoffs:
+
+- In-memory session state is simple and fast for the curated subset and 100+
+  sample runs.
+- Corpus counters are O(number of generated chains) and cheap to serialize.
+- Full ToolBench scale may require indexed graph traversal, cached embeddings,
+  and possibly a graph/vector store for artifact exploration.
+- We avoid external databases in the submitted MVP so reviewers can run the
+  pipeline without service setup.
+
+### Context Tests
+
+Implemented tests cover:
+
+- strict grounding rejects hallucinated grounded values
+- previous tool outputs validate when reused
+- canonical response aliases ground later parameters
+- `example_values()` exposes issued prior outputs to LLM agents
+- steering counters track domains, tools, endpoints, endpoint pairs, chain
+  lengths, and domain patterns
+- steering on/off produces different corpora while both runs retain
+  comparable counters
+
+## 17. Open Design Areas
 
 Still to implement:
 - Diversity experiment

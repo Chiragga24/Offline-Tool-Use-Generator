@@ -301,17 +301,17 @@ Testing reminder:
 
 ### 9. Context Management
 
-- [ ] Within-conversation grounding:
+- [x] Within-conversation grounding:
   - maintain state store of returned IDs and salient fields
   - expose state to tool-call argument builder
   - validate dependencies after each step
-- [ ] Cross-conversation steering:
+- [x] Cross-conversation steering:
   - maintain corpus-level counters
   - steer away from repeated domains, tools, endpoint pairs, and chain lengths
   - allow disabling with CLI flag
-- [ ] Document limitations and scale tradeoffs in `DESIGN.md`.
-- [ ] Add tests for state grounding.
-- [ ] Add tests for corpus steering counters.
+- [x] Document limitations and scale tradeoffs in `DESIGN.md`.
+- [x] Add tests for state grounding.
+- [x] Add tests for corpus steering counters.
 
 Testing reminder:
 

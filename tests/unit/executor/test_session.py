@@ -23,7 +23,9 @@ from kg_mle.executor import (
 )
 from kg_mle.graph import build_tool_graph
 from kg_mle.registry import enrich_registry, load_registry
+from kg_mle.registry.models import Endpoint, Parameter, ResponseField, Tool, ToolRegistry
 from kg_mle.sampler import ChainConstraints, SamplingResult, ToolChainSampler
+from kg_mle.sampler.constraints import Transition
 
 
 @pytest.fixture(scope="module")
@@ -240,3 +242,87 @@ def test_grounded_id_from_previous_step_validates(registry_and_sampler):
             issued_value in session.state.issued_ids(transition.source_field)
         )
     assert isinstance(response_two, dict)
+
+
+def test_canonical_alias_from_response_state_grounds_later_parameter():
+    """A response field can ground a later parameter through canonical_name.
+
+    This is the within-conversation context path for messy ToolBench-style
+    schemas: one API returns `available_time`, another asks for
+    `start_time`, and deterministic enrichment/normalization connects them
+    through the canonical key.
+    """
+    registry = ToolRegistry(
+        tools=[
+            Tool(
+                domain="food",
+                category="Food",
+                tool_name="availability",
+                description="Availability APIs.",
+                endpoints=[
+                    Endpoint(
+                        endpoint_id="food/check_availability",
+                        domain="food",
+                        category="Food",
+                        tool_name="availability",
+                        name="check_availability",
+                        path="/availability",
+                        description="Check availability.",
+                        parameters=[],
+                        response_fields=[
+                            ResponseField(
+                                name="available_time",
+                                type="string",
+                                canonical_name="start_time",
+                            )
+                        ],
+                    ),
+                    Endpoint(
+                        endpoint_id="events/create_calendar_event",
+                        domain="events",
+                        category="Events",
+                        tool_name="calendar",
+                        name="create_calendar_event",
+                        path="/calendar",
+                        description="Create a calendar event.",
+                        parameters=[
+                            Parameter(
+                                name="start_time",
+                                type="string",
+                                required=True,
+                                description="Start time.",
+                                canonical_name="start_time",
+                            )
+                        ],
+                        response_fields=[ResponseField(name="calendar_event_id", type="string")],
+                    ),
+                ],
+            )
+        ]
+    )
+    sampling_result = SamplingResult(
+        endpoints=("food/check_availability", "events/create_calendar_event"),
+        transitions=(
+            Transition(
+                source="food/check_availability",
+                target="events/create_calendar_event",
+                advance_type="grounded",
+                parameter="start_time",
+                source_field="start_time",
+                match_type="canonical",
+            ),
+        ),
+        pattern="sequential",
+        seed=1,
+        constraints=ChainConstraints(n_steps=2),
+    )
+    session = OfflineExecutor(registry).open_session(sampling_result, seed=1)
+
+    first_response = session.call("food/check_availability", {})
+    suggested = session.suggest_arguments("events/create_calendar_event")
+
+    assert first_response["available_time"] in session.state.issued_ids("available_time")
+    assert first_response["available_time"] in session.state.issued_ids("start_time")
+    assert suggested["start_time"] == first_response["available_time"]
+    second_response = session.call("events/create_calendar_event", suggested)
+    assert second_response["calendar_event_id"]

@@ -50,6 +50,44 @@ def test_steerer_flags_overused_endpoint_for_forbid_list():
     assert "events/b" not in forbidden
 
 
+def test_steerer_flags_overused_endpoint_pair_for_diversity_diagnostics():
+    steerer = CorpusSteerer(target_count=100, endpoint_count=10, pair_overuse_factor=1.2)
+    for _ in range(12):
+        steerer.record(
+            _result(
+                endpoints=("travel/a", "events/b"),
+                transitions=(
+                    Transition(source="travel/a", target="events/b", advance_type="grounded"),
+                ),
+            )
+        )
+
+    assert ("travel/a", "events/b") in steerer.forbid_endpoint_pairs()
+
+
+def test_counters_summary_exposes_cross_conversation_context_fields():
+    steerer = CorpusSteerer(target_count=10, endpoint_count=4)
+    steerer.record(
+        _result(
+            endpoints=("finance/a", "weather/b", "events/c"),
+            transitions=(
+                Transition(source="finance/a", target="weather/b", advance_type="same_domain"),
+                Transition(source="weather/b", target="events/c", advance_type="grounded"),
+            ),
+            tools_visited=("finance_tool", "weather_tool", "events_tool"),
+        )
+    )
+    summary = steerer.counters.as_summary()
+
+    assert summary["chain_count"] == 1
+    assert summary["domain_counts"]["finance"] == 1
+    assert summary["tool_counts"]["weather_tool"] == 1
+    assert summary["endpoint_counts"]["events/c"] == 1
+    assert summary["endpoint_pair_counts"]["weather/b->events/c"] == 1
+    assert summary["chain_length_counts"]["3"] == 1
+    assert summary["domain_pattern_counts"]["finance->weather->events"] == 1
+
+
 def test_steerer_threshold_has_hard_floor_for_small_corpora():
     """Small target_count should not let the threshold drop below 3, otherwise
     the forbid list fills up so fast the planner runs out of options."""
