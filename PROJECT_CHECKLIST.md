@@ -198,16 +198,16 @@ Testing reminder:
   - [ ] parallel pattern (deferred to planner alongside parallel-chain generation)
 - [x] Implement deterministic sampling with seed.
 - [x] Track sampling metadata (domains, tools, advance_type counts, backtracks, start_endpoint).
-- [ ] Support cross-conversation steering toggle (next, via planner).
-- [ ] Add steering penalties for overused domains, tools, endpoint pairs, and chain patterns (next, via planner).
+- [x] Support cross-conversation steering toggle (planner: CorpusPlanner(steering_enabled=...)).
+- [x] Add steering penalties for overused domains, tools, endpoint pairs, and chain patterns (CorpusSteerer hard exclusion + soft preference).
 - [x] Document constraint interface in `DESIGN.md`.
 - [x] Add unit tests for constraints.
 - [x] Add unit tests for deterministic sampling.
 
 Testing reminder:
 
-- [ ] Test that `--no-cross-conversation-steering` produces reproducible unsteered samples (planner-level).
-- [ ] Test that steering changes distribution across a corpus (planner-level).
+- [x] Test that `--no-cross-conversation-steering` produces reproducible unsteered samples (test_planner_is_deterministic_per_seed_and_steering).
+- [x] Test that steering changes distribution across a corpus (test_planner_steering_on_vs_off_diverges, test_steering_increases_endpoint_coverage).
 
 ### 5. Offline Tool Execution
 

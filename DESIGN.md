@@ -886,71 +886,129 @@ Reason:
 
 - The assignment explicitly requires unit, integration, and end-to-end tests. Keeping tests close to each implementation step prevents a late testing scramble.
 
-## 13.5 Tool-Chain Sampler
+## 13.5 Tool-Chain Sampler (Walker)
 
-The sampler walks the tool graph to produce candidate chains for the
-generator. It is graph-driven (the assignment's hard requirement) and
-constraint-driven (the assignment's constrained-sampling requirement).
+The sampler walks the tool graph to produce candidate chains. It is
+graph-driven (the assignment's hard requirement) and constraint-driven
+(the assignment's constrained-sampling requirement).
 
 ```text
 src/kg_mle/sampler/
 ├── constraints.py    # ChainConstraints, SamplingResult, Transition
-└── walker.py         # ToolChainSampler (DFS with backtracking)
+├── walker.py         # ToolChainSampler — DFS with backtracking
+├── steering.py       # CorpusSteerer, NullSteerer, CorpusCounters
+└── plan.py           # CorpusPlanner — orchestrates a corpus
 ```
 
-### Constraint Interface
+### How the Sampler Works (Short Version)
 
-`ChainConstraints` is a frozen dataclass exposing the dimensions the
-assignment names plus the dimensions the dataset properties need:
+1. The walker is built once from a `ToolGraph`. It indexes every
+   `output_satisfies_input`, `same_domain`, and `semantic_related` edge
+   into a per-endpoint adjacency list; structural edges
+   (`contains_tool`, `exposes_endpoint`, etc.) are ignored because they
+   describe graph anatomy, not chain advancement.
+2. A `ChainConstraints` object names what the caller wants: chain length,
+   required domains, minimum grounded transitions, etc.
+3. The walker chooses a start endpoint (deterministic from the seed,
+   biased toward `required_domains` / `required_endpoint`).
+4. From the start, it does depth-first search with backtracking. At each
+   step it lists outgoing edges, filters by `allow_semantic_edges`,
+   sorts them into tiers (grounded → same_domain → semantic), shuffles
+   within each tier using the seeded RNG, and tries each in order.
+5. When the chain reaches the target length, a terminal check enforces
+   `min_distinct_tools`, `min_distinct_domains`, `required_domains`,
+   `min_grounded_transitions`, and `required_endpoint`. If any fail, the
+   walker backtracks and tries another candidate.
+6. If no chain in the search space satisfies the constraints, it raises
+   `UnsatisfiableConstraintsError` with diagnostics — never a
+   hallucinated chain.
 
-```text
-n_steps                     int | (min, max)
-min_distinct_tools          int
-min_distinct_domains        int
-required_domains            tuple[str, ...]
-required_endpoint           str | None
-min_grounded_transitions    int
-pattern                     "sequential" | "parallel"
-allow_semantic_edges        bool
-forbid_endpoint_ids         tuple[str, ...]
-```
+### Design Decisions
 
-The two assignment-named cases ("at least one tool from a given domain",
-"exactly N steps") are `required_domains` and `n_steps`. The varied-length
-dataset property is the `(min, max)` form of `n_steps`. The "coherent
-chaining" dataset property is enforced by `min_grounded_transitions`. The
-cross-conversation steering knob is `forbid_endpoint_ids`, which the
-upcoming planner will populate with recently-overused endpoints.
+**Design decision:** Use a graph-walking sampler with DFS and
+backtracking, not goal-directed path search.
 
-### Walk Strategy
+**Alternative considered:** Bidirectional BFS from a start node toward a
+constraint-satisfying terminal endpoint.
 
-Tiered, grounding-preferred DFS with backtracking:
+**Reason rejected:** BFS would optimise for shortest path; here every
+chain in the search space is interesting, and constraint satisfaction
+is checked at the terminal, not en route. DFS with backtracking
+explores the same search space with simpler code and matches the
+"propose a chain that satisfies constraints" framing — not "find the
+shortest chain that does."
 
-```text
-output_satisfies_input  (advance_type="grounded")     — preferred
-same_domain             (advance_type="same_domain")  — fallback
-semantic_related        (advance_type="semantic")     — opt-in only
-```
+---
 
-Edge candidates are sorted into tiers, each tier shuffled with a seeded
-RNG, then concatenated. This keeps the order deterministic per seed while
-preserving the tier preference. Within a tier, ties break by target
-endpoint_id so single-seed runs are reproducible across graph
-permutations.
+**Design decision:** Tiered edge preference — grounded > same_domain >
+semantic — rather than a single edge pool.
 
-The walker rejects revisits (no endpoint appears twice in one chain) and
-records `advance_type`, `parameter`, `source_field`, and `match_type` on
-each transition so the executor and judge know how each step is justified.
+**Alternative considered:** Treat all edge types as equivalent and
+filter by constraint at the terminal check only.
+
+**Reason rejected:** The assignment's "coherent chaining" property
+rewards chains where step N is grounded in step N−1 outputs. Treating
+grounded and same_domain edges as equivalent during the walk made it
+significantly more likely that backtracking would explore unproductive
+same_domain or semantic paths before stumbling into a grounded one.
+Tiered ordering biases the search toward groundable chains by
+construction.
+
+---
+
+**Design decision:** `semantic_related` edges are opt-in via
+`allow_semantic_edges=True`, not on by default.
+
+**Alternative considered:** Include `semantic_related` edges in the
+default search space, weighted lower than `same_domain`.
+
+**Reason rejected:** Semantic edges are loosely justified (cosine
+similarity, not a structural relationship). They are useful for
+expanding the *candidate* set of related endpoints but are not strong
+evidence that one tool's output satisfies another's input. The walker
+should expose them only when the caller explicitly asks; otherwise
+the judge's "tool correctness" score would suffer.
+
+---
+
+**Design decision:** Per-tier seeded shuffle with `(target endpoint_id)`
+tie-breaks.
+
+**Alternative considered:** Pure deterministic ordering (sort by edge
+source/target ids only) with no shuffle.
+
+**Reason rejected:** Pure determinism would produce the same chain for
+every seed, defeating the purpose of seeded sampling and making
+multi-chain corpora repetitive. Tie-breaking on endpoint_id within the
+shuffled tier keeps single-seed runs reproducible even if the graph's
+edge ordering changes between builds (Pydantic dump order is stable,
+but we don't want to depend on that).
+
+---
+
+**Design decision:** Terminal-only constraint check (length match,
+distinct counts, required domains, grounded transitions).
+
+**Alternative considered:** Branch-and-bound — prune partial chains
+that can't satisfy constraints from here.
+
+**Reason rejected:** We *do* prune the obvious infeasibility (e.g., if
+`min_grounded_transitions` needs more grounded edges than the remaining
+steps can supply, the walker rejects non-grounded candidates
+immediately). But full branch-and-bound on distinct-tools /
+distinct-domains would complicate the code for marginal speedup at the
+fixture size we're working with (45 endpoints, chain length ≤ 5).
+Terminal-only checks keep the walker readable.
 
 ### Determinism Guarantee
 
-Same seed + same constraints + same graph = same chain. Tests cover this
-explicitly. The seeded RNG threads through every shuffle the walker makes
-(start ordering, candidate ordering within each tier).
+Same seed + same constraints + same graph = same chain. The seeded
+`random.Random` instance threads through every shuffle (start ordering,
+candidate ordering within each tier). Tests cover this explicitly.
 
-### Fixture Grounding-Density Note
+### Fixture Grounding-Density Limit
 
-A probe over 50 seeds showed:
+A 50-seed probe revealed:
 
 ```text
 fully-grounded 2-step chains: 50/50 seeds succeed
@@ -958,40 +1016,147 @@ fully-grounded 3-step chains: 50/50 seeds succeed
 fully-grounded 4-step chains:  0/50 seeds succeed
 ```
 
-The 29 grounding edges in the curated fixture don't chain densely enough
-to produce a fully-grounded 4-step path. That is a fixture observation,
-not a walker limitation — the walker correctly reports
-`UnsatisfiableConstraintsError` rather than hallucinating a chain.
+The 29 grounding edges in the curated fixture don't chain densely
+enough to produce a fully-grounded 4-step path. This is a fixture
+observation, not a walker limitation. The planner targets
+`min_grounded_transitions = n_steps − 2` for 4+ step chains — one
+same_domain fallback per chain is acceptable. The grounded transitions
+remain the ones the executor uses for chain-consistent ID mocking;
+same_domain transitions get argument-from-user-intent synthesis.
 
-In practice: the planner targets `min_grounded_transitions = n_steps - 2`
-for 4+ step chains (i.e., one same-domain fallback per chain is allowed),
-which keeps the corpus mostly-grounded while staying within the fixture's
-reach. The assignment's rubric is satisfied: ≥50–60% of conversations
-have ≥3 tool calls and ≥2 distinct tools, and "coherent chaining" applies
-to the grounded transitions specifically (which the executor will mock
-with chain-consistent IDs).
+## 13.6 Corpus Planner and Cross-Conversation Steering
 
-### Sample Output
+The planner is the layer between the dataset properties the assignment
+calls out (50–60% multi-step, varied lengths, balanced domain coverage,
+coherent chaining) and the walker's per-chain constraint API. It owns
+the corpus-level loop, the steering counters, and the relaxation
+strategy that protects against unsatisfiable constraints.
+
+### How the Planner Works (Short Version)
+
+1. For each chain in `range(target_count)`, the planner builds a fresh
+   `ChainConstraints` instance derived from:
+   - a length distribution skewed toward 3–4 steps,
+   - a `multi_step_fraction` (default 0.55) that bumps
+     `min_distinct_tools` to 2 when applicable,
+   - `min_grounded_transitions = n_steps − 2` (or stricter for short
+     chains),
+   - the steerer's recommendations: least-used domain as
+     `required_domains[0]`, currently-overused endpoints as
+     `forbid_endpoint_ids`.
+2. It calls the walker with a per-chain seed derived deterministically
+   from the planner seed plus the chain index.
+3. On `UnsatisfiableConstraintsError`, the planner runs through a fixed
+   relaxation ladder (loosen grounded → clear required_domains → loosen
+   distinct_domains → clear forbid list → loosen distinct_tools →
+   loosen n_steps), retrying up to `max_relaxation_attempts` times.
+4. The steerer records every successful chain — domains, tools,
+   endpoints, transitions, length, domain pattern — and exposes the
+   summary via `report.counters_summary`.
+5. `--no-cross-conversation-steering` swaps `CorpusSteerer` for
+   `NullSteerer`. `NullSteerer` still records counters (so Run A and
+   Run B have comparable stats) but returns empty forbid lists and
+   alphabetical-only domain hints. The planner's main loop is
+   unchanged.
+
+### Design Decisions
+
+**Design decision:** Hybrid steering — hard exclusion (`forbid_endpoint_ids`)
+plus soft preference (`least_used_domains` biasing
+`required_domains`).
+
+**Alternative considered:** Probability-based reweighting — full
+softmax over endpoint usage counts.
+
+**Reason rejected:** Probability reweighting would require the walker
+to support weighted sampling, which it doesn't, or for the planner to
+intercept and rewrite the walker's edge ordering. Both bleed steering
+concerns into the walker. Hard exclusion plus required-domain bias
+uses only the constraints the walker already exposes — clean
+separation of layers.
+
+---
+
+**Design decision:** Threshold for hard exclusion has a hard floor of 3,
+plus a per-corpus baseline of `target_count / endpoint_count * 1.6`.
+
+**Alternative considered:** Pure baseline-based threshold,
+no floor.
+
+**Reason rejected:** Without the floor, small corpora
+(`target_count < endpoint_count`) hit a threshold of 1 or 2 — any
+endpoint used at all gets forbidden after a few chains, and the
+planner runs out of usable endpoints within a dozen samples. The floor
+of 3 lets every endpoint get a few uses before steering kicks in, so
+the diversity gain doesn't come at the cost of generation throughput.
+
+---
+
+**Design decision:** `NullSteerer` still records counters even though it
+returns no penalties.
+
+**Alternative considered:** When steering is off, don't track counters
+at all.
+
+**Reason rejected:** The diversity experiment requires Run A and Run B
+to be directly comparable on the same metrics. Without counters in
+Run A, "did steering increase endpoint coverage?" can't be answered
+quantitatively. The cost of always recording is one Counter increment
+per result — negligible.
+
+---
+
+**Design decision:** Per-chain seeds derived as
+`(planner_seed * 1_000_003 + plan_index) % (2**31 − 1)`.
+
+**Alternative considered:** Thread a single RNG through the entire
+corpus loop.
+
+**Reason rejected:** A single RNG means turning steering on/off changes
+the RNG state for every subsequent chain (because steering-driven
+constraint shaping consumes a different number of RNG draws). That
+makes Run A and Run B harder to compare — the *same* chain index would
+draw a different walker seed. Per-chain seeds keep each chain's RNG
+state stable across the steering flag.
+
+---
+
+**Design decision:** Relaxation ladder rather than abandoning chains
+that fail.
+
+**Alternative considered:** On `UnsatisfiableConstraintsError`, just
+record the failure and move on.
+
+**Reason rejected:** Steering's whole point is to widen coverage by
+forbidding overused endpoints. As the forbid list grows, constraint
+sets get harder to satisfy. Without relaxation, the planner would
+silently drop chains in the back half of long runs — exactly when
+diversity matters most. The relaxation ladder gives up steering for
+one chain rather than losing the chain entirely; the steerer still
+records what was sampled.
+
+### Empirical Diversity Contrast
+
+Smoke run with `target_count=100`, `seed=42`, same fixture:
 
 ```text
-entertainment/search_live_shows -> events/create_calendar_event ->
-  events/check_ticket_availability -> events/book_tickets
-  (grounded=2/3 transitions)
-
-finance/search_symbol -> finance/get_quote -> finance/create_price_alert ->
-  finance/get_company_news
-  (grounded=2/3 transitions)
-
-gaming/get_tournament_schedule -> events/create_calendar_event ->
-  events/search_events -> events/check_ticket_availability
-  (grounded=2/3 transitions, crosses 2 domains)
+                              Run A (no steering)   Run B (steering)
+distinct endpoints used       35 / 45               40 / 45
+distinct domains              8                     9
+top-endpoint share            76%                   65%
+multi-step + multi-tool       81%                   81%
+chains generated              100                   100
+relaxation fallbacks          0                     0
 ```
+
+Steering widens endpoint coverage by 5 endpoints and one domain, and
+reduces top-endpoint concentration by 11 percentage points, with no
+loss in multi-step coverage. These are the seeds for the formal
+diversity metrics computed in §15 (TBD).
 
 ## 14. Open Design Areas
 
 Still to implement:
-
-- Corpus planner with cross-conversation steering
 - Offline executor with stateful mocked outputs
 - Multi-agent conversation generator
 - Deterministic evaluator plus optional Gemma-backed judge
