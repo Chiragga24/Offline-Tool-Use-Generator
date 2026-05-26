@@ -153,6 +153,19 @@ Any other OpenAI-compatible API can be added without code changes by
 setting `KG_MLE_LLM_PROVIDER=openai` (or any of the OpenAI-compatible
 provider names) plus `KG_MLE_LLM_BASE_URL=https://your-host/v1`.
 
+**Why Gemini is the default (honest version).** Gemini won on
+free-tier availability and familiarity. I tried Groq and Hugging Face
+first and hit friction with both (HF: the chat-route/model-availability
+and billing issues described in §11; Groq: setup/quota friction during
+testing), so I fell back to Gemini to get the pipeline exercised
+end-to-end. Given the time budget, I chose to invest in making the
+client *provider-neutral* — so any of the providers above can be
+selected from `.env` — rather than spending that time debugging the
+HF/Groq-specific issues. The default is pragmatic, not a claim that
+Gemini is best; the abstraction is the real design decision, and a
+reviewer with working Groq/HF/OpenAI/Anthropic credentials can switch
+with one env var.
+
 **Anthropic JSON-mode trick.** Anthropic's Messages API doesn't expose a
 native `response_format=json_object`, so the adapter does two things:
 prepends a strict "return only JSON" instruction to the system prompt,
