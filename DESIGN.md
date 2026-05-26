@@ -343,6 +343,7 @@ Implementation status:
 - A Hugging Face registry enricher is implemented behind `--llm-enrich-registry`.
 - Local live test with `KG_MLE_LLM_MODEL=google/gemma-4-E2B-it` reached Hugging Face, but the HF router reported that the configured model is not available as a chat model and has no text-generation provider mapping.
 - Live test with `KG_MLE_LLM_MODEL=Qwen/Qwen2.5-3B-Instruct` and `KG_MLE_HF_PROVIDER=featherless-ai` successfully reached a provider-backed conversational endpoint and returned JSON-shaped suggestions, proving the integration path works. A full run was stopped by provider billing/credit limits (`402 Payment Required`), so live LLM enrichment remains explicit opt-in.
+- A `@pytest.mark.live` integration test (`tests/integration/test_hf_enricher_live.py`) now exercises the enricher against 2 endpoints when `HF_TOKEN` is present and the provider is reachable. It asserts the report is well-formed (whitelisted `canonical_name`, valid confidence, field application reflects the suggestion) but does not assert specific suggestions — LLM output is non-deterministic by design.
 - Therefore live Gemma enrichment is not enabled by default. The deterministic and fake structured-enrichment paths remain fully tested.
 - To use live registry enrichment, configure a Hugging Face-hosted instruction model that supports the Inference API/router, or configure a future local provider such as Ollama, LM Studio, vLLM, or LiteLLM for Gemma.
 
@@ -638,9 +639,12 @@ credentials. Unit tests cover:
 - results are capped at the requested `top_k`
 
 The real Mem0 path (with Hugging Face embeddings, Gemini LLM, and an
-in-memory Qdrant store) is exercised by hand during graph builds with
-`--semantic-backend mem0`, but is not in CI because it needs `HF_TOKEN` and
-`GOOGLE_API_KEY`. The injected-memory tests are the safety net.
+in-memory Qdrant store) is now covered by a live integration test
+(`tests/integration/test_mem0_live.py`) that runs when `HF_TOKEN` and
+`GOOGLE_API_KEY` are present and skips otherwise. It asserts the
+index/search contract — not specific semantic matches, because ANN is
+approximate. The injected-memory unit tests remain the credential-free
+safety net for the result-parsing contract.
 
 ## 10.1 LLM Provider Orchestration
 
@@ -849,8 +853,30 @@ Current coverage:
 Current result:
 
 ```text
-49 passed
+51 passed
 ```
+
+### Live Integration Tests
+
+Two `@pytest.mark.live` tests in `tests/integration/` exercise the real
+external paths when credentials are present and skip cleanly otherwise:
+
+- `test_mem0_live.py` — indexes 4 endpoint cards through real Mem0 (HF
+  embeddings, Gemini LLM, in-memory Qdrant) and asserts the search results
+  are drawn from the indexed set, scored, and sorted descending. It does
+  not assert specific semantic matches because ANN + model drift would
+  make that flaky.
+- `test_hf_enricher_live.py` — runs the HF registry enricher against 2
+  endpoints (capped via `max_llm_endpoints`) and asserts the report is
+  well-formed: every accepted suggestion has a whitelisted
+  `canonical_name`, a confidence in `[0, 1]`, and is reflected on the
+  actual field. It does not assert that any specific field gets enriched.
+
+Both tests skip — not fail — on missing credentials, provider rejection
+(402 billing, model unavailable), or transient outages. The intent is
+to catch *protocol regressions* (Mem0 result-shape change, HF API
+shape change, JSON-extraction parser drift) without flaking CI on
+provider availability.
 
 Design decision:
 

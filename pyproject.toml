@@ -36,6 +36,9 @@ packages = ["src/kg_mle"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "live: integration tests that call real external services (Mem0, Hugging Face) — auto-skip when credentials are missing or the provider rejects the request.",
+]
 
 [tool.ruff]
 line-length = 100
