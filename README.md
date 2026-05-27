@@ -393,7 +393,7 @@ See [`docs/sample_outputs/`](docs/sample_outputs) for real (trimmed) versions of
 .\.venv\Scripts\python.exe -m pytest tests -m "not live"
 ```
 
-185 non-live tests run offline without credentials. Five `@pytest.mark.live` tests run
+193 non-live tests run offline without credentials. Five `@pytest.mark.live` tests run
 against a real provider when an API key is present and skip cleanly otherwise.
 The E2E test (`tests/e2e/test_pipeline_100.py`) builds artifacts, generates 100
 conversations, evaluates them through the LLM-judge interface with a

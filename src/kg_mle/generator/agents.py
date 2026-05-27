@@ -203,6 +203,7 @@ class DeterministicUser:
         return UserTurn(
             content=f"For {target_parameter}, use {value}.",
             is_clarification_reply=True,
+            clarified_value=str(value),
         )
 
     @staticmethod

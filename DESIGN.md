@@ -59,7 +59,7 @@ by default, with all LLM features behind opt-in flags.
 
 Steering widens coverage without hurting quality. Full breakdown in #10.
 
-**Test status:** 185 non-live tests pass without credentials
+**Test status:** 193 non-live tests pass without credentials
 (`pytest -m "not live"`); five `@pytest.mark.live` tests run when API
 keys are present and skip cleanly otherwise.
 
@@ -1069,6 +1069,66 @@ parser drift), not asserting LLM quality.
   the *integration path* is intact (the same code path a real
   Gemini/Groq judge would traverse) but not real judging quality. A
   real-provider 100-sample run is a manual step, not CI.
+
+### Manual live LLM smoke
+
+In a local-only experimental branch, I wired the provider-neutral LLM
+adapter to an external authenticated helper and used it to smoke-test the
+hosted LLM path end to end without committing that local provider to
+`main`. On May 26, 2026 I ran:
+
+```text
+kgmle build --llm-enrich-registry --max-llm-registry-endpoints 1
+kgmle --use-llm generate --count 1 --seed 99
+kgmle --use-llm evaluate --max-llm-judge-records 1
+```
+
+Initial observed results:
+
+| Check | Result |
+| --- | ---: |
+| LLM registry enrichments accepted | 8-9 across runs |
+| Generated records / failures | 1 / 0 |
+| Agent mode | `llm-with-fallback` |
+| Deterministic score | 10.0 |
+| LLM-judged records | 1 |
+| Best live LLM overall score | 6.5 |
+| Best live argument grounding score | 9.0 |
+| Completion guarantee needed in best run | false |
+
+The important finding was not that every live sample passed quality; the
+early smoke did not. The live judge first rejected the sample for
+ungrounded same-domain arguments: invented location, ignored
+clarification values, and inconsistent city/date choices. That confirmed
+the real LLM integration path works (enrichment, generation, judge), but
+also exposed a blind spot in deterministic evaluation: it catches
+structural validity and grounded `output_satisfies_input` edges, but not
+all semantic consistency failures on `same_domain` transitions.
+
+I added targeted guardrails from this finding:
+
+- coordinator-level argument sanitization rebuilds LLM tool arguments
+  from executor suggestions, user-clarified plan values, and recent
+  runtime context before execution;
+- user clarification parsing now handles non-template replies, not only
+  `"For X, use Y."`;
+- premature LLM final summaries and empty LLM tool-call turns fall back
+  to bounded directive LLM re-prompts before the deterministic assistant
+  completes the planned chain;
+- when the completion guarantee fires, `metadata.completion_guarantee`
+  records the trigger reason, LLM re-prompt attempts, whether a re-prompt
+  recovered, and any deterministic turns used to finish the trace;
+- the LLM user prompt now receives the full plan so its natural-language
+  request is less likely to contradict concrete planner values.
+
+The full non-live suite after these changes is 193 passed / 5 live
+deselected. A follow-up live smoke completed all planned tool calls
+without deterministic completion fallback and scored 9.0 on argument
+grounding, but still received only 6.5 overall because the final
+assistant response was too generic and omitted returned tool details. The
+core submission remains deterministic and reproducible; live LLM
+generation is useful, but judge-triggered response repair remains an open
+area before I would claim production-quality hosted output.
 
 ## 14. Open Areas
 

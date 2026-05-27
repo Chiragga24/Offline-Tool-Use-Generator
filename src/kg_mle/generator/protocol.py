@@ -103,6 +103,10 @@ class UserTurn(BaseModel):
     content: str
     is_initial_request: bool = False
     is_clarification_reply: bool = False
+    clarified_value: str | None = None
+    """On a clarification reply, the exact value to use for the asked
+    parameter — a structured field so the coordinator never has to parse it
+    out of natural-language prose."""
 
 
 class ClarificationTarget(BaseModel):
@@ -148,6 +152,9 @@ class GeneratorConfig(BaseModel):
     assistant_clarification_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     assistant_deviation_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     max_llm_retries: int = Field(default=1, ge=0, le=5)
+    max_stall_reprompts: int = Field(default=2, ge=0, le=3)
+    """Bounded directive retries when an LLM assistant stalls before the
+    deterministic completion guarantee takes over."""
     max_repair_attempts: int = Field(default=1, ge=0, le=3)
     ambiguity_fraction: float = Field(default=0.4, ge=0.0, le=1.0)
     """Fraction of conversations the deterministic planner injects

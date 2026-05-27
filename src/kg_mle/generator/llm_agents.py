@@ -263,6 +263,11 @@ class LLMUser:
             {
                 "intent": plan.conversation_intent,
                 "character": plan.user_character,
+                "plan": plan.model_dump(),
+                "instruction": (
+                    "The user request must be consistent with the concrete "
+                    "parameter values in the plan."
+                ),
                 "output_schema": {
                     "content": "string — the user's natural-language opening message",
                     "is_initial_request": True,
@@ -285,9 +290,15 @@ class LLMUser:
                 "intent": plan.conversation_intent,
                 "asked_about_parameter": target_parameter,
                 "your_preferred_value": target_value,
-                "instruction": "Briefly answer the assistant's clarifying question.",
+                "instruction": (
+                    "Briefly answer the assistant's clarifying question in natural "
+                    "language in 'content'. Put ONLY the exact value to use for "
+                    f"'{target_parameter}' in 'clarified_value' — no label, no prose, "
+                    "no surrounding text."
+                ),
                 "output_schema": {
-                    "content": "string",
+                    "content": "string — natural-language reply",
+                    "clarified_value": f"string — the bare value for {target_parameter}",
                     "is_initial_request": False,
                     "is_clarification_reply": True,
                 },

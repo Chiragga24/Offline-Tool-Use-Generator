@@ -25,11 +25,12 @@ from kg_mle.generator import (
     DeterministicUser,
     GeneratorConfig,
 )
-from kg_mle.generator.agents import Assistant
-from kg_mle.generator.protocol import AssistantTurn, ToolCallProposal
+from kg_mle.generator.agents import Assistant, UserSimulator
+from kg_mle.generator.coordinator import _extract_clarified_value
+from kg_mle.generator.protocol import AssistantTurn, ToolCallProposal, UserTurn
 from kg_mle.graph import build_tool_graph
 from kg_mle.registry import enrich_registry, load_registry
-from kg_mle.sampler import ChainConstraints, ToolChainSampler
+from kg_mle.sampler import ChainConstraints, SamplingResult, ToolChainSampler, Transition
 
 
 @pytest.fixture(scope="module")
@@ -208,6 +209,380 @@ def test_repair_flow_recovers_after_bad_args(pipeline):
         for m in conv.messages
     )
     assert has_error and has_success
+
+
+class _HallucinatedArgsAssistant(Assistant):
+    def compose_turn(
+        self, plan, transcript, session, *, steps_completed, clarifications_taken, config, seed
+    ):
+        if steps_completed >= len(plan.step_plans):
+            return AssistantTurn(kind="final_summary", content="done.")
+        step = plan.step_plans[steps_completed]
+        args = session.suggest_arguments(step.endpoint_id)
+        if step.endpoint_id == "events/create_calendar_event":
+            args.update(
+                {
+                    "title": "League of Legends Tournament",
+                    "location": "LoL Park, Seoul",
+                    "event_type": "tournament",
+                    "hallucinated_key": "not a real parameter",
+                }
+            )
+        return AssistantTurn(
+            kind="tool_calls",
+            tool_calls=[ToolCallProposal(endpoint_id=step.endpoint_id, arguments=args)],
+        )
+
+
+def test_coordinator_sanitizes_llm_hallucinated_locality_args(pipeline):
+    registry, graph, _, executor = pipeline
+    chain = SamplingResult(
+        endpoints=("gaming/get_tournament_schedule", "events/create_calendar_event"),
+        transitions=(
+            Transition(
+                source="gaming/get_tournament_schedule",
+                target="events/create_calendar_event",
+                advance_type="grounded",
+                parameter="start_time",
+                source_field="start_time",
+                match_type="canonical",
+            ),
+        ),
+        pattern="sequential",
+        seed=99,
+        constraints=ChainConstraints(n_steps=2, min_grounded_transitions=1),
+        metadata={"tools_visited": ["gaming_catalog", "events_calendar"]},
+    )
+    coord = ConversationCoordinator(
+        registry=registry,
+        graph=graph,
+        executor=executor,
+        planner=DeterministicPlanner(registry, config=GeneratorConfig(ambiguity_fraction=0.0)),
+        user_simulator=DeterministicUser(),
+        assistant=_HallucinatedArgsAssistant(),
+        config=GeneratorConfig(ambiguity_fraction=0.0),
+    )
+
+    conv = coord.run(chain, seed=99)
+
+    first_response = next(
+        m["content"]
+        for m in conv.messages
+        if m["role"] == "tool" and m["endpoint"] == "gaming/get_tournament_schedule"
+    )
+    calendar_call = next(
+        m["tool_calls"][0]
+        for m in conv.messages
+        if m.get("tool_calls")
+        and m["tool_calls"][0]["endpoint_id"] == "events/create_calendar_event"
+    )
+    # Grounded + locality fields are reconciled to the prior tool output.
+    assert calendar_call["arguments"]["start_time"] == first_response["start_time"]
+    assert calendar_call["arguments"]["location"] == first_response["venue"]
+    assert calendar_call["arguments"]["location"] != "LoL Park, Seoul"
+    # ...but the LLM's type-valid free-text title (no grounding constraint) is
+    # PRESERVED, not reset to a deterministic placeholder. This is the
+    # selective-sanitizer guarantee: keep what fits, override only provenance.
+    assert calendar_call["arguments"]["title"] == "League of Legends Tournament"
+    assert calendar_call["arguments"]["event_type"] == "tournament"
+    # Undeclared (hallucinated) keys are dropped so they never reach the dataset.
+    assert "hallucinated_key" not in calendar_call["arguments"]
+
+
+class _FakeStateForContext:
+    def __init__(self, issued):
+        self._issued = issued
+        self.log = []
+
+    def issued_ids(self, key):
+        return tuple(self._issued.get(key, ()))
+
+
+class _FakeSessionForContext:
+    def __init__(self, issued):
+        self.state = _FakeStateForContext(issued)
+
+
+def test_contextual_value_does_not_bridge_venue_into_city():
+    from kg_mle.generator.coordinator import _contextual_value_for_param
+
+    session = _FakeSessionForContext({"venue": ("Midtown",), "location": ("Midtown",)})
+    # `location` still pulls the prior venue/location — coherence preserved.
+    assert (
+        _contextual_value_for_param("location", None, session=session, plan_value=None, user_clarified=False)
+        == "Midtown"
+    )
+    # `city` must NOT inherit a venue/location string; it keeps its clean plan value.
+    assert (
+        _contextual_value_for_param("city", None, session=session, plan_value="Las Vegas", user_clarified=False)
+        is None
+    )
+
+
+def test_contextual_value_bridges_venue_to_location_without_enrichment():
+    from kg_mle.generator.coordinator import _contextual_value_for_param
+
+    # Only `venue` was issued (no `location` key) — the cluster still bridges.
+    session = _FakeSessionForContext({"venue": ("Old Town",)})
+    assert (
+        _contextual_value_for_param("location", None, session=session, plan_value=None, user_clarified=False)
+        == "Old Town"
+    )
+
+
+def test_extract_clarified_value_strips_param_prefix_and_filler():
+    # Deterministic template.
+    assert _extract_clarified_value("For city, use Paris.", "city") == "Paris"
+    # LLM phrasing that previously leaked "the game_id" into the value.
+    assert _extract_clarified_value("Use the game_id valorant.", "game_id") == "valorant"
+    assert _extract_clarified_value("game_id is valorant", "game_id") == "valorant"
+    # Bare value.
+    assert _extract_clarified_value("valorant", "game_id") == "valorant"
+    # Trailing filler that restates the parameter.
+    assert (
+        _extract_clarified_value("Use Las Vegas Convention Center as the location.", "location")
+        == "Las Vegas Convention Center"
+    )
+    assert _extract_clarified_value("Paris for the city", "city") == "Paris"
+
+
+class _LLMStyleUser(UserSimulator):
+    """Mimics an LLM user: vague prose in `content`, exact value in the
+    structured `clarified_value` field. Prose and value deliberately disagree
+    so the test proves the coordinator prefers the structured field."""
+
+    def initial_request(self, plan, *, seed):
+        return UserTurn(content="Help me with this, please.", is_initial_request=True)
+
+    def reply_to_clarification(self, plan, *, target_step, target_parameter, seed):
+        return UserTurn(
+            content="Hmm, whatever you think is best honestly.",  # no parseable value
+            is_clarification_reply=True,
+            clarified_value="SENTINEL_VALUE",
+        )
+
+
+def test_clarification_prefers_structured_value_over_prose(pipeline):
+    registry, graph, sampler, executor = pipeline
+    chain = _chain(sampler, n_steps=2, min_grounded_transitions=1)
+    coord = ConversationCoordinator(
+        registry=registry,
+        graph=graph,
+        executor=executor,
+        # Force a clarification on step 0.
+        planner=DeterministicPlanner(registry, config=GeneratorConfig(ambiguity_fraction=1.0)),
+        user_simulator=_LLMStyleUser(),
+        assistant=DeterministicAssistant(),
+        config=GeneratorConfig(ambiguity_fraction=1.0),
+    )
+
+    conv = coord.run(chain, seed=42)
+
+    clarified_param = next(
+        (
+            m["clarification_target_parameter"]
+            for m in conv.messages
+            if m["role"] == "assistant" and m.get("clarification_target_parameter")
+        ),
+        None,
+    )
+    if clarified_param is None:
+        pytest.skip("No clarification fired for this chain/seed.")
+
+    # The tool call for the clarified step must use the STRUCTURED value, not
+    # the vague prose. If the coordinator had parsed `content`, the arg would be
+    # the garbage sentence instead.
+    tool_call_args = next(
+        m["tool_calls"][0]["arguments"]
+        for m in conv.messages
+        if m.get("tool_calls") and clarified_param in m["tool_calls"][0]["arguments"]
+    )
+    assert tool_call_args[clarified_param] == "SENTINEL_VALUE"
+
+
+class _LaterStepAmbiguousPlanner(DeterministicPlanner):
+    """Marks a non-first step ambiguous, like an LLM planner can — the case
+    that previously made a stalling assistant truncate the chain."""
+
+    def plan(self, sampling_result, *, seed):
+        base = super().plan(sampling_result, seed=seed)
+        if len(base.step_plans) > 1 and base.step_plans[1].parameter_plans:
+            base.ambiguous_step_indices = [1]
+            base.step_plans[1].parameter_plans[0].ambiguous = True
+            base.step_plans[1].parameter_plans[0].confidence = 0.3
+        return base
+
+
+class _StallAfterFirstAssistant(Assistant):
+    """Real tool call at step 0, then always claims tool_calls with none —
+    mimics an LLM that stops making progress after the first step."""
+
+    def compose_turn(
+        self, plan, transcript, session, *, steps_completed, clarifications_taken, config, seed
+    ):
+        if steps_completed == 0:
+            step = plan.step_plans[0]
+            return AssistantTurn(
+                kind="tool_calls",
+                tool_calls=[
+                    ToolCallProposal(
+                        endpoint_id=step.endpoint_id,
+                        arguments=session.suggest_arguments(step.endpoint_id),
+                    )
+                ],
+            )
+        return AssistantTurn(kind="tool_calls", tool_calls=[])
+
+
+def test_coordinator_completes_chain_when_llm_stalls(pipeline):
+    """A stalling LLM (empty tool_calls) with a later ambiguous step must still
+    yield a complete, grounded conversation ending in a final summary — not a
+    truncated trace that silently reports success."""
+    registry, graph, sampler, executor = pipeline
+    chain = _chain(sampler, n_steps=3, min_grounded_transitions=1)
+    coord = ConversationCoordinator(
+        registry=registry,
+        graph=graph,
+        executor=executor,
+        planner=_LaterStepAmbiguousPlanner(registry, config=GeneratorConfig()),
+        user_simulator=DeterministicUser(),
+        assistant=_StallAfterFirstAssistant(),
+        config=GeneratorConfig(),
+    )
+
+    conv = coord.run(chain, seed=42)
+
+    successful = [
+        m
+        for m in conv.messages
+        if m["role"] == "tool"
+        and not (isinstance(m["content"], dict) and "error" in m["content"])
+    ]
+    assert len(successful) == len(chain.endpoints), (
+        f"chain truncated: {len(successful)}/{len(chain.endpoints)} steps completed"
+    )
+    # Ends with a final assistant summary, not a dangling tool response.
+    last = conv.messages[-1]
+    assert last["role"] == "assistant" and last.get("content") and not last.get("tool_calls")
+    guarantee = conv.metadata["completion_guarantee"]
+    assert guarantee["triggered"] is True
+    assert guarantee["reason"] == "empty_tool_calls"
+    assert guarantee["llm_reprompt_attempts"] >= 2
+    assert guarantee["llm_reprompt_succeeded"] is False
+    assert guarantee["deterministic_turns"]
+
+
+class _RecoverAfterDirectiveAssistant(Assistant):
+    """Stalls once, then follows the internal retry directive with an LLM-authored
+    tool call. The directive must not be written into the public transcript."""
+
+    def compose_turn(
+        self, plan, transcript, session, *, steps_completed, clarifications_taken, config, seed
+    ):
+        if steps_completed == 0:
+            step = plan.step_plans[0]
+            return AssistantTurn(
+                kind="tool_calls",
+                tool_calls=[
+                    ToolCallProposal(
+                        endpoint_id=step.endpoint_id,
+                        arguments=session.suggest_arguments(step.endpoint_id),
+                    )
+                ],
+            )
+        if transcript and "Coordinator internal retry directive" in str(transcript[-1].get("content")):
+            step = plan.step_plans[steps_completed]
+            return AssistantTurn(
+                kind="tool_calls",
+                tool_calls=[
+                    ToolCallProposal(
+                        endpoint_id=step.endpoint_id,
+                        arguments=session.suggest_arguments(step.endpoint_id),
+                    )
+                ],
+            )
+        return AssistantTurn(kind="tool_calls", tool_calls=[])
+
+
+def test_stall_reprompt_recovers_before_deterministic_fallback(pipeline):
+    registry, graph, sampler, executor = pipeline
+    chain = _chain(sampler, n_steps=2, min_grounded_transitions=1)
+    coord = ConversationCoordinator(
+        registry=registry,
+        graph=graph,
+        executor=executor,
+        planner=DeterministicPlanner(registry, config=GeneratorConfig(ambiguity_fraction=0.0)),
+        user_simulator=DeterministicUser(),
+        assistant=_RecoverAfterDirectiveAssistant(),
+        config=GeneratorConfig(ambiguity_fraction=0.0, max_stall_reprompts=2),
+    )
+
+    conv = coord.run(chain, seed=42)
+
+    successful = [
+        m
+        for m in conv.messages
+        if m["role"] == "tool"
+        and not (isinstance(m["content"], dict) and "error" in m["content"])
+    ]
+    assert len(successful) == 2
+    guarantee = conv.metadata["completion_guarantee"]
+    assert guarantee["triggered"] is True
+    assert guarantee["reason"] == "empty_tool_calls"
+    assert guarantee["llm_reprompt_attempts"] == 1
+    assert guarantee["llm_reprompt_succeeded"] is True
+    # Only the deterministic final summary should be recorded, not the recovered tool call.
+    assert all(turn.get("endpoint_id") != chain.endpoints[1] for turn in guarantee["deterministic_turns"])
+    assert not any(
+        "Coordinator internal retry directive" in str(message.get("content"))
+        for message in conv.messages
+    )
+
+
+class _PrematureFinalAssistant(Assistant):
+    def compose_turn(
+        self, plan, transcript, session, *, steps_completed, clarifications_taken, config, seed
+    ):
+        if steps_completed == 0:
+            step = plan.step_plans[0]
+            return AssistantTurn(
+                kind="tool_calls",
+                tool_calls=[
+                    ToolCallProposal(
+                        endpoint_id=step.endpoint_id,
+                        arguments=session.suggest_arguments(step.endpoint_id),
+                    )
+                ],
+            )
+        return AssistantTurn(kind="final_summary", content="done too early.")
+
+
+def test_coordinator_rejects_premature_final_summary(pipeline):
+    registry, graph, sampler, executor = pipeline
+    chain = _chain(sampler, n_steps=2, min_grounded_transitions=1)
+    coord = ConversationCoordinator(
+        registry=registry,
+        graph=graph,
+        executor=executor,
+        planner=DeterministicPlanner(registry, config=GeneratorConfig(ambiguity_fraction=0.0)),
+        user_simulator=DeterministicUser(),
+        assistant=_PrematureFinalAssistant(),
+        config=GeneratorConfig(ambiguity_fraction=0.0),
+    )
+
+    conv = coord.run(chain, seed=42)
+
+    successful = [
+        m
+        for m in conv.messages
+        if m["role"] == "tool" and not (isinstance(m["content"], dict) and "error" in m["content"])
+    ]
+    assert len(successful) == 2
+    assert conv.messages[-1]["role"] == "assistant"
+    guarantee = conv.metadata["completion_guarantee"]
+    assert guarantee["triggered"] is True
+    assert guarantee["reason"] == "premature_final_summary"
+    assert guarantee["deterministic_turns"]
 
 
 # ----- chain deviations ----------------------------------------------------
